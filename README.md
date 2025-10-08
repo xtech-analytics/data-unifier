@@ -18,27 +18,31 @@ pip install unifier
 
 ## Usage
 
-Here's a basic example of how to use the Unifier package:
+Here's a basic example of how to use the unifier package:
 
 ```python
-from unifier import Unifier
+from unifier import unifier
 
 # Set your user and token
-Unifier.user = 'your_username'
-Unifier.token = 'your_api_token'
+unifier.user = 'your_username'
+unifier.token = 'your_api_token'
 
 # Query the API
-response = Unifier.query(name='your_dataset_name')
+response = unifier.query(name='your_dataset_name')
 
 # Convert the response to a DataFrame
-df = Unifier.get_dataframe(name='your_dataset_name')
+df = unifier.get_dataframe(name='your_dataset_name')
 
+print(df.head())
+
+# Get list asof_date available for a dataset
+df = unifier.get_asof_dates(name='dataset_name')
 print(df.head())
 ```
 
 ## Configuration
 
-Before using the package, ensure you set your `user` and `token` attributes in the `Unifier` class to authenticate with the API.
+Before using the package, ensure you set your `user` and `token` attributes in the `unifier` class to authenticate with the API.
 
 ## License
 

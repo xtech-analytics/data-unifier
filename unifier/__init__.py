@@ -1,3 +1,3 @@
-from .unifier import Unifier
+from .unifier import Unifier as unifier
 
-__all__ = ['Unifier']
+__all__ = ['unifier']
