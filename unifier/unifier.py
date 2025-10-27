@@ -21,7 +21,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.12'
+    __version__ = '0.1.13'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -47,7 +47,7 @@ class Unifier:
 
         _url = cls.url + "/get_asof_date"
         try:
-            response = requests.post(_url, headers=headers, json=payload, timeout=30)
+            response = requests.post(_url, headers=headers, json=payload)
             if response.status_code != 200:
                 # Try to surface server-provided error, otherwise log status code.
                 try:
@@ -169,7 +169,7 @@ class Unifier:
             payload["asof_date"] = asof_date
 
         try:
-            response = requests.post(cls.url, headers=headers, json=payload, timeout=60)
+            response = requests.post(cls.url, headers=headers, json=payload)
             if response.status_code != 200:
                 try:
                     err = response.json()
