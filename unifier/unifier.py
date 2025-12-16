@@ -24,7 +24,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.14'
+    __version__ = '0.1.16'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -342,6 +342,7 @@ class Unifier:
                 return
 
             resp_json = response.json()
+
             data = resp_json.get("data")
             if not data:
                 logger.warning("Unifier replicate response missing 'data' field")
@@ -387,7 +388,7 @@ class Unifier:
             for folder in folders:
                 if folder.startswith("/"):
                     folder = folder.lstrip("/")
-                if folder.endswith("/*"):
+                if folder.endswith("*"):
                     folder = folder[:-1] + "**"
                 cmd.extend(["--include", folder])
 
