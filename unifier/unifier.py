@@ -1,4 +1,7 @@
 import logging
+import os
+import subprocess
+import shutil
 from typing import Any, Dict, List, Optional, Sequence
 
 import requests
@@ -21,7 +24,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.13'
+    __version__ = '0.1.14'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -279,3 +282,122 @@ class Unifier:
             {k: v for d in item for k, v in d.items()} for item in json_result
         ]
         return extracted_data
+
+    @classmethod
+    def replicate(
+        cls,
+        name: str,
+        target_location: str,
+        asof_date: Optional[str] = None,
+        back_to: Optional[str] = None,
+        up_to: Optional[str] = None,
+        bandwidth_limit: Optional[int] = None,
+    ) -> None:
+        """Replicate data to a local target location using rclone.
+
+        Parameters
+        ----------
+        name : str
+            The dataset name to replicate.
+        target_location : str
+            The local directory path where data should be downloaded.
+        asof_date : Optional[str]
+            The specific date for the data replication (format: YYYY-MM-DD).
+        back_to : Optional[str]
+            The start date for the data replication (format: YYYY-MM-DD).
+        up_to : Optional[str]
+            The end date for the data replication (format: YYYY-MM-DD).
+        bandwidth_limit : Optional[int]
+            The bandwidth limit in MB/s for the replication process.
+        """
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "name": name,
+            "user": cls.user,
+            "token": cls.token,
+        }
+        
+        if asof_date:
+            payload["asof_date"] = asof_date
+        if back_to:
+            payload["back_to"] = back_to
+        if up_to:
+            payload["up_to"] = up_to
+
+        if not shutil.which("rclone"):
+            logger.error("Rclone is not installed. Please install it to use this feature (https://rclone.org/downloads/).")
+            return
+
+        _url = cls.url + "/replicate"
+
+        try:
+            # Fetch replication credentials
+            response = requests.post(_url, headers=headers, json=payload)
+            if response.status_code != 200:
+                try:
+                    err_msg = response.json().get("error", "Unknown error")
+                except ValueError:
+                    err_msg = response.text
+                logger.warning("Unifier replicate error: %s", err_msg)
+                return
+
+            resp_json = response.json()
+            data = resp_json.get("data")
+            if not data:
+                logger.warning("Unifier replicate response missing 'data' field")
+                return
+
+            access_key_id = data.get("access_key_id")
+            secret_access_key = data.get("secret_access_key")
+            data_path = resp_json.get("data_path")
+            folders = resp_json.get("folders", [])
+            endpoint = resp_json.get("endpoint", "https://s3.wasabisys.com")
+            region = resp_json.get("region", "us-east-1")
+
+            if not (access_key_id and secret_access_key and data_path):
+                logger.warning("Unifier replicate missing required credentials or path")
+                return
+
+            # Prepare rclone environment
+            env = os.environ.copy()
+            env["RCLONE_CONFIG_UNIFIER_TYPE"] = "s3"
+            env["RCLONE_CONFIG_UNIFIER_PROVIDER"] = "Wasabi"
+            env["RCLONE_CONFIG_UNIFIER_ENV_AUTH"] = "false"
+            env["RCLONE_CONFIG_UNIFIER_ACCESS_KEY_ID"] = access_key_id
+            env["RCLONE_CONFIG_UNIFIER_SECRET_ACCESS_KEY"] = secret_access_key
+            env["RCLONE_CONFIG_UNIFIER_ENDPOINT"] = endpoint
+            env["RCLONE_CONFIG_UNIFIER_REGION"] = region
+
+            # Handle s3:// prefix
+            if data_path.startswith("s3://"):
+                data_path = data_path[5:]
+            elif data_path.startswith("s3a://"):
+                data_path = data_path[6:]
+
+            source = f"UNIFIER:{data_path}"
+            if not source.endswith("/"):
+                source += "/"
+
+            # Construct command
+            cmd = ["rclone", "copy", source, target_location, "--progress", "--config", "/dev/null"]
+
+            if bandwidth_limit:
+                 cmd.extend(["--bwlimit", f"{bandwidth_limit}M"])
+
+            for folder in folders:
+                if folder.startswith("/"):
+                    folder = folder.lstrip("/")
+                if folder.endswith("/*"):
+                    folder = folder[:-1] + "**"
+                cmd.extend(["--include", folder])
+
+            logger.info("Starting rclone replication for %s...", name)
+            subprocess.run(cmd, env=env, check=True)
+            logger.info("Replication completed for %s", name)
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Replicate network request failed: %s", e)
+        except subprocess.CalledProcessError as e:
+            logger.error("Rclone execution failed: %s", e)
+        except Exception as e:
+            logger.error("An unexpected error occurred during replication: %s", e)

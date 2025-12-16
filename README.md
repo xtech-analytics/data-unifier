@@ -7,6 +7,7 @@ Unifier is a Python package that provides a simple interface to interact with th
 - Query the Unifier API for data.
 - Retrieve data in JSON format.
 - Convert API responses into pandas DataFrames for easy data manipulation and analysis.
+- Efficiently replicate large datasets to local storage using rclone integration.
 
 ## Installation
 
@@ -15,6 +16,8 @@ You can install the package via pip:
 ```bash
 pip install unifier
 ```
+
+To use the **Data Replication** feature, you must also install [rclone](https://rclone.org/downloads/).
 
 ## Usage
 
@@ -36,8 +39,18 @@ df = unifier.get_dataframe(name='your_dataset_name')
 print(df.head())
 
 # Get list asof_date available for a dataset
-df = unifier.get_asof_dates(name='dataset_name')
-print(df.head())
+dates_df = unifier.get_asof_dates(name='dataset_name')
+print(dates_df.head())
+
+# Replicate a large dataset to a local folder
+# Note: rclone must be installed on your system
+unifier.replicate(
+    name="large_dataset_name",
+    target_location="./data/downloads",
+    back_to="2023-01-01",    # Optional: fetch history back to this date
+    up_to="2024-12-16",    # Optional: fetch history up to this date
+    bandwidth_limit=20       # Optional: limit download speed to 20MB/s
+)
 ```
 
 ## Configuration
