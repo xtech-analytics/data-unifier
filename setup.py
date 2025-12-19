@@ -2,11 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name='unifier',
-    version='0.1.16',
+    version='0.1.17',
     packages=find_packages(),
     install_requires=[
         'requests',
         'pandas',
+        'boto3',
     ],
     author='xtech',
     author_email='support@exponential-tech.ai',

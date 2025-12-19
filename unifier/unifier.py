@@ -3,9 +3,18 @@ import os
 import subprocess
 import shutil
 from typing import Any, Dict, List, Optional, Sequence
+import fnmatch
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pandas as pd
+try:
+    import boto3
+    from botocore.client import Config
+    from boto3.s3.transfer import TransferConfig
+except ImportError:
+    boto3 = None
+    TransferConfig = None
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +33,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.16'
+    __version__ = '0.1.17'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -292,8 +301,9 @@ class Unifier:
         back_to: Optional[str] = None,
         up_to: Optional[str] = None,
         bandwidth_limit: Optional[int] = None,
+        use_rclone: bool = True,
     ) -> None:
-        """Replicate data to a local target location using rclone.
+        """Replicate data to a local target location using rclone or native python.
 
         Parameters
         ----------
@@ -308,7 +318,10 @@ class Unifier:
         up_to : Optional[str]
             The end date for the data replication (format: YYYY-MM-DD).
         bandwidth_limit : Optional[int]
-            The bandwidth limit in MB/s for the replication process.
+            The bandwidth limit in MB/s for the replication process (rclone only).
+        use_rclone : bool
+            If True, attempt to use rclone. Falls back to native Python implementation
+            if rclone is not available.
         """
         headers = {"Content-Type": "application/json"}
         payload = {
@@ -324,9 +337,12 @@ class Unifier:
         if up_to:
             payload["up_to"] = up_to
 
-        if not shutil.which("rclone"):
-            logger.error("Rclone is not installed. Please install it to use this feature (https://rclone.org/downloads/).")
-            return
+        # Check for rclone availability
+        rclone_path = shutil.which("rclone")
+        using_rclone = use_rclone and (rclone_path is not None)
+
+        if use_rclone and not rclone_path:
+            logger.info("Rclone is not installed. Falling back to native Python replication.")
 
         _url = cls.url + "/replicate"
 
@@ -338,14 +354,18 @@ class Unifier:
                     err_msg = response.json().get("error", "Unknown error")
                 except ValueError:
                     err_msg = response.text
-                logger.warning("Unifier replicate error: %s", err_msg)
+                err_msg = f"Unifier replicate error: {err_msg}"
+                logger.warning(err_msg)
+                print(err_msg)
                 return
 
             resp_json = response.json()
 
             data = resp_json.get("data")
             if not data:
-                logger.warning("Unifier replicate response missing 'data' field")
+                err_msg = "Unifier replicate response missing 'data' field"
+                logger.warning(err_msg)
+                print(err_msg)
                 return
 
             access_key_id = data.get("access_key_id")
@@ -356,49 +376,172 @@ class Unifier:
             region = resp_json.get("region", "us-east-1")
 
             if not (access_key_id and secret_access_key and data_path):
-                logger.warning("Unifier replicate missing required credentials or path")
+                err_msg = "Unifier replicate missing required credentials or path"
+                logger.warning(err_msg)
+                print(err_msg)
                 return
 
-            # Prepare rclone environment
-            env = os.environ.copy()
-            env["RCLONE_CONFIG_UNIFIER_TYPE"] = "s3"
-            env["RCLONE_CONFIG_UNIFIER_PROVIDER"] = "Wasabi"
-            env["RCLONE_CONFIG_UNIFIER_ENV_AUTH"] = "false"
-            env["RCLONE_CONFIG_UNIFIER_ACCESS_KEY_ID"] = access_key_id
-            env["RCLONE_CONFIG_UNIFIER_SECRET_ACCESS_KEY"] = secret_access_key
-            env["RCLONE_CONFIG_UNIFIER_ENDPOINT"] = endpoint
-            env["RCLONE_CONFIG_UNIFIER_REGION"] = region
-
-            # Handle s3:// prefix
+            # Handle s3:// or s3a:// prefix
             if data_path.startswith("s3://"):
                 data_path = data_path[5:]
             elif data_path.startswith("s3a://"):
                 data_path = data_path[6:]
 
-            source = f"UNIFIER:{data_path}"
-            if not source.endswith("/"):
-                source += "/"
+            if using_rclone:
+                # Prepare rclone environment
+                env = os.environ.copy()
+                env["RCLONE_CONFIG_UNIFIER_TYPE"] = "s3"
+                env["RCLONE_CONFIG_UNIFIER_PROVIDER"] = "Wasabi"
+                env["RCLONE_CONFIG_UNIFIER_ENV_AUTH"] = "false"
+                env["RCLONE_CONFIG_UNIFIER_ACCESS_KEY_ID"] = access_key_id
+                env["RCLONE_CONFIG_UNIFIER_SECRET_ACCESS_KEY"] = secret_access_key
+                env["RCLONE_CONFIG_UNIFIER_ENDPOINT"] = endpoint
+                env["RCLONE_CONFIG_UNIFIER_REGION"] = region
 
-            # Construct command
-            cmd = ["rclone", "copy", source, target_location, "--progress", "--config", "/dev/null"]
+                source = f"UNIFIER:{data_path}"
+                if not source.endswith("/"):
+                    source += "/"
 
-            if bandwidth_limit:
-                 cmd.extend(["--bwlimit", f"{bandwidth_limit}M"])
+                # Construct command
+                cmd = ["rclone", "copy", source, target_location, "--progress", "--config", "/dev/null"]
 
-            for folder in folders:
-                if folder.startswith("/"):
-                    folder = folder.lstrip("/")
-                if folder.endswith("*"):
-                    folder = folder[:-1] + "**"
-                cmd.extend(["--include", folder])
+                if bandwidth_limit:
+                     cmd.extend(["--bwlimit", f"{bandwidth_limit}M"])
 
-            logger.info("Starting rclone replication for %s...", name)
-            subprocess.run(cmd, env=env, check=True)
-            logger.info("Replication completed for %s", name)
+                for folder in folders:
+                    if folder.startswith("/"):
+                        folder = folder.lstrip("/")
+                    if folder.endswith("*"):
+                        folder = folder[:-1] + "**"
+                    cmd.extend(["--include", folder])
+
+                print(f"Starting rclone replication for {name}...")
+                subprocess.run(cmd, env=env, check=True)
+                print(f"Replication completed for {name}")
+            else:
+                cls._replicate_native(
+                    access_key_id=access_key_id,
+                    secret_access_key=secret_access_key,
+                    endpoint=endpoint,
+                    region=region,
+                    data_path=data_path,
+                    target_location=target_location,
+                    folders=folders,
+                    name=name
+                )
 
         except requests.exceptions.RequestException as e:
-            logger.error("Replicate network request failed: %s", e)
+            err_msg = f"Replicate network request failed: {e}"
+            logger.error(err_msg)
+            print(err_msg)
         except subprocess.CalledProcessError as e:
-            logger.error("Rclone execution failed: %s", e)
+            err_msg = f"Rclone execution failed: {e}"
+            logger.error(err_msg)
+            print(err_msg)
         except Exception as e:
-            logger.error("An unexpected error occurred during replication: %s", e)
+            err_msg = f"An unexpected error occurred during replication: {e}"
+            logger.error(err_msg)
+            print(err_msg)
+
+    @classmethod
+    def _replicate_native(
+        cls,
+        access_key_id: str,
+        secret_access_key: str,
+        endpoint: str,
+        region: str,
+        data_path: str,
+        target_location: str,
+        folders: List[str],
+        name: str
+    ) -> None:
+        """Fallback replication using boto3."""
+        if boto3 is None:
+            logger.error("boto3 is not installed. Cannot use native replication fallback.")
+            logger.info("Please install boto3: pip install boto3")
+            return
+
+        session = boto3.Session()
+        s3 = session.client(
+            's3',
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            endpoint_url=endpoint,
+            region_name=region,
+            config=Config(signature_version='s3v4')
+        )
+        
+        parts = data_path.split('/', 1)
+        bucket_name = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ""
+        if prefix and not prefix.endswith('/'):
+            prefix += '/'
+
+        match_patterns = []
+        for f in folders:
+            if f.startswith("/"):
+                f = f.lstrip("/")
+            match_patterns.append(f)
+
+        print(f"Starting native python replication for {name} (parallel)...")
+
+        # Configure transfer settings for parallel parts download within a single file
+        transfer_config = TransferConfig(
+            multipart_threshold=1024 * 25,  # 25MB
+            max_concurrency=10
+        )
+
+        try:
+            paginator = s3.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+            
+            download_tasks = []
+            for page in pages:
+                if 'Contents' not in page:
+                    continue
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    
+                    # Calculate relative path
+                    if not key.startswith(prefix):
+                         continue
+                    rel_path = key[len(prefix):]
+                    if not rel_path:
+                        continue 
+
+                    # Filter
+                    if match_patterns:
+                        if not any(fnmatch.fnmatch(rel_path, p) for p in match_patterns):
+                            continue
+                    
+                    local_file = os.path.join(target_location, rel_path)
+                    download_tasks.append((bucket_name, key, local_file))
+            
+            total_files = len(download_tasks)
+            if total_files == 0:
+                print(f"No files found to replicate for {name}")
+                return
+
+            print(f"Found {total_files} files to download.")
+
+            def _download_one(args):
+                b_name, k, l_file = args
+                local_dir = os.path.dirname(l_file)
+                os.makedirs(local_dir, exist_ok=True)
+                # s3 client is thread-safe
+                s3.download_file(b_name, k, l_file, Config=transfer_config)
+
+            # Use ThreadPoolExecutor for parallel file downloads
+            completed_count = 0
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # We use list() to consume the iterator and wait for all tasks to complete
+                for _ in executor.map(_download_one, download_tasks):
+                    completed_count += 1
+                    if completed_count % 10 == 0:
+                        print(f"Downloaded {completed_count}/{total_files} files...")
+            
+            print(f"Native replication completed for {name}. Downloaded {total_files} files.")
+        except Exception as e:
+            err_msg = f"Native replication failed: {e}"
+            logger.error(err_msg)
+            print(err_msg)
