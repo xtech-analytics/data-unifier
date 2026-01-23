@@ -17,7 +17,7 @@ You can install the package via pip:
 pip install unifier
 ```
 
-To use the **Data Replication** feature, you must also install [rclone](https://rclone.org/downloads/).
+To use the **Data Replication** feature, it is recommended to install [rclone](https://rclone.org/downloads/) for better performance. If `rclone` is not available, the package will automatically fall back to a native Python implementation for downloads.
 
 ## Usage
 
@@ -43,7 +43,7 @@ dates_df = unifier.get_asof_dates(name='dataset_name')
 print(dates_df.head())
 
 # Replicate a large dataset to a local folder
-# Note: rclone must be installed on your system
+# Note: uses rclone if installed, otherwise uses native python download
 unifier.replicate(
     name="large_dataset_name",
     target_location="./data/downloads",

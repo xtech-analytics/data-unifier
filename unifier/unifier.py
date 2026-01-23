@@ -29,11 +29,11 @@ class Unifier:
       `asof_back_to`.
     """
     
-    url = 'https://unifier.exponential-tech.ai/unifier'
+    url = 'https://unifier.x-tech.ai/unifier'
     user = ''
     token = ''
 
-    __version__ = '0.1.17'
+    __version__ = '0.1.18'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -341,9 +341,6 @@ class Unifier:
         rclone_path = shutil.which("rclone")
         using_rclone = use_rclone and (rclone_path is not None)
 
-        if use_rclone and not rclone_path:
-            logger.info("Rclone is not installed. Falling back to native Python replication.")
-
         _url = cls.url + "/replicate"
 
         try:
@@ -415,7 +412,7 @@ class Unifier:
                         folder = folder[:-1] + "**"
                     cmd.extend(["--include", folder])
 
-                print(f"Starting rclone replication for {name}...")
+                print(f"Downloading with rclone for {name}...")
                 subprocess.run(cmd, env=env, check=True)
                 print(f"Replication completed for {name}")
             else:
@@ -455,9 +452,9 @@ class Unifier:
         folders: List[str],
         name: str
     ) -> None:
-        """Fallback replication using boto3."""
+        """Replication using native Python (boto3)."""
         if boto3 is None:
-            logger.error("boto3 is not installed. Cannot use native replication fallback.")
+            logger.error("boto3 is not installed. Cannot use native Python implementation.")
             logger.info("Please install boto3: pip install boto3")
             return
 
@@ -483,7 +480,7 @@ class Unifier:
                 f = f.lstrip("/")
             match_patterns.append(f)
 
-        print(f"Starting native python replication for {name} (parallel)...")
+        print(f"Downloading using native python implementation for {name}...")
 
         # Configure transfer settings for parallel parts download within a single file
         transfer_config = TransferConfig(
