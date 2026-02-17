@@ -33,7 +33,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.19'
+    __version__ = '0.1.20'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -100,8 +100,8 @@ class Unifier:
         return cls.get_asof_dates_query(name)
 
     @classmethod
-    def list_data_catalogs(cls) -> List[Dict[str, Any]]:
-        """Retrieve all available data catalogs the user is entitled to see.
+    def list_data_catalog(cls) -> List[Dict[str, Any]]:
+        """Retrieve all available datasets the user is entitled to see.
 
         Returns
         -------
@@ -123,18 +123,18 @@ class Unifier:
                 except ValueError:
                     err = {}
                 if isinstance(err, dict) and "error" in err:
-                    logger.warning("Unifier list-data-catalogs error: %s", err["error"])
+                    logger.warning("Unifier list-data-catalog error: %s", err["error"])
                 else:
-                    logger.warning("Unifier list-data-catalogs failed with status code %s", response.status_code)
+                    logger.warning("Unifier list-data-catalog failed with status code %s", response.status_code)
                 return []
 
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error("Unifier list-data-catalogs request failed: %s", e)
+            logger.error("Unifier list-data-catalog request failed: %s", e)
             return []
 
     @classmethod
-    def get_data_catalog(cls, name: str) -> Dict[str, Any]:
+    def get_dataset_details(cls, name: str) -> Dict[str, Any]:
         """Retrieve detailed metadata for a specific dataset.
 
         Parameters
@@ -163,14 +163,14 @@ class Unifier:
                 except ValueError:
                     err = {}
                 if isinstance(err, dict) and "error" in err:
-                    logger.warning("Unifier get-data-catalog error: %s", err["error"])
+                    logger.warning("Unifier get-dataset-details error: %s", err["error"])
                 else:
-                    logger.warning("Unifier get-data-catalog failed with status code %s", response.status_code)
+                    logger.warning("Unifier get-dataset-details failed with status code %s", response.status_code)
                 return {}
 
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error("Unifier get-data-catalog request failed: %s", e)
+            logger.error("Unifier get-dataset-details request failed: %s", e)
             return {}
 
     @classmethod

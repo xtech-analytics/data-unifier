@@ -8,7 +8,7 @@ Unifier is a Python package that provides a simple interface to interact with th
 - Retrieve data in JSON format.
 - Convert API responses into pandas DataFrames for easy data manipulation and analysis.
 - Efficiently replicate large datasets to local storage using rclone integration.
-- List and retrieve detailed metadata for data catalogs.
+- List and retrieve detailed metadata for datasets in the catalog.
 
 ## Installation
 
@@ -43,13 +43,13 @@ print(df.head())
 dates_df = unifier.get_asof_dates(name='dataset_name')
 print(dates_df.head())
 
-# List all available data catalogs
-catalogs = unifier.list_data_catalogs()
-print(catalogs)
+# List all available datasets in the catalog
+datasets = unifier.list_data_catalog()
+print(datasets)
 
-# Get detailed metadata for a specific catalog
-catalog = unifier.get_data_catalog(name='dataset_name')
-print(catalog)
+# Get detailed metadata for a specific dataset
+details = unifier.get_dataset_details(name='dataset_name')
+print(details)
 
 # Replicate a large dataset to a local folder
 # Note: uses rclone if installed, otherwise uses native python download
