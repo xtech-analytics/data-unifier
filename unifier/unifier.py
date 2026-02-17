@@ -33,7 +33,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.18'
+    __version__ = '0.1.19'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -98,6 +98,80 @@ class Unifier:
     def get_asof_dates_json(cls, name: str) -> List[Dict[str, Any]]:
         """Get a Python list of available as-of dates for a given name."""
         return cls.get_asof_dates_query(name)
+
+    @classmethod
+    def list_data_catalogs(cls) -> List[Dict[str, Any]]:
+        """Retrieve all available data catalogs the user is entitled to see.
+
+        Returns
+        -------
+        list[dict]
+            A list of dataset metadata objects. Returns an empty list on error.
+        """
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "user": cls.user,
+            "token": cls.token,
+        }
+
+        _url = cls.url + "/list-data-catalogs"
+        try:
+            response = requests.post(_url, headers=headers, json=payload)
+            if response.status_code != 200:
+                try:
+                    err = response.json()
+                except ValueError:
+                    err = {}
+                if isinstance(err, dict) and "error" in err:
+                    logger.warning("Unifier list-data-catalogs error: %s", err["error"])
+                else:
+                    logger.warning("Unifier list-data-catalogs failed with status code %s", response.status_code)
+                return []
+
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error("Unifier list-data-catalogs request failed: %s", e)
+            return []
+
+    @classmethod
+    def get_data_catalog(cls, name: str) -> Dict[str, Any]:
+        """Retrieve detailed metadata for a specific dataset.
+
+        Parameters
+        ----------
+        name : str
+            The dataset name.
+
+        Returns
+        -------
+        dict
+            The dataset metadata object. Returns an empty dict on error.
+        """
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "name": name,
+            "user": cls.user,
+            "token": cls.token,
+        }
+
+        _url = cls.url + "/data-catalog"
+        try:
+            response = requests.post(_url, headers=headers, json=payload)
+            if response.status_code != 200:
+                try:
+                    err = response.json()
+                except ValueError:
+                    err = {}
+                if isinstance(err, dict) and "error" in err:
+                    logger.warning("Unifier get-data-catalog error: %s", err["error"])
+                else:
+                    logger.warning("Unifier get-data-catalog failed with status code %s", response.status_code)
+                return {}
+
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error("Unifier get-data-catalog request failed: %s", e)
+            return {}
 
     @classmethod
     def query(
