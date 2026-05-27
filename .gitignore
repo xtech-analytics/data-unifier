@@ -163,3 +163,10 @@ cython_debug/
 
 **/.help.txt
 .vscode/
+
+# Local test scripts
+test_local.py
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
