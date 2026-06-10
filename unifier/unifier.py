@@ -33,7 +33,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.20'
+    __version__ = '0.1.21'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -533,13 +533,27 @@ class Unifier:
             return
 
         session = boto3.Session()
+        # botocore >= 1.36 enables request/response data-integrity checksums by
+        # default. Wasabi (and other S3-compatible stores) reject these on
+        # multipart/ranged GETs, returning SignatureDoesNotMatch. Disable them
+        # when the running botocore supports the options.
+        config_kwargs = {'signature_version': 's3v4'}
+        try:
+            s3_config = Config(
+                request_checksum_calculation='when_required',
+                response_checksum_validation='when_required',
+                **config_kwargs,
+            )
+        except TypeError:
+            s3_config = Config(**config_kwargs)
+
         s3 = session.client(
             's3',
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
             endpoint_url=endpoint,
             region_name=region,
-            config=Config(signature_version='s3v4')
+            config=s3_config,
         )
         
         parts = data_path.split('/', 1)
@@ -555,12 +569,6 @@ class Unifier:
             match_patterns.append(f)
 
         print(f"Downloading using native python implementation for {name}...")
-
-        # Configure transfer settings for parallel parts download within a single file
-        transfer_config = TransferConfig(
-            multipart_threshold=1024 * 25,  # 25MB
-            max_concurrency=10
-        )
 
         try:
             paginator = s3.get_paginator('list_objects_v2')
@@ -599,8 +607,9 @@ class Unifier:
                 b_name, k, l_file = args
                 local_dir = os.path.dirname(l_file)
                 os.makedirs(local_dir, exist_ok=True)
-                # s3 client is thread-safe
-                s3.download_file(b_name, k, l_file, Config=transfer_config)
+                # s3 client is thread-safe. Use boto3's default TransferConfig
+                # (8 MB multipart threshold) so small files use a single GET.
+                s3.download_file(b_name, k, l_file)
 
             # Use ThreadPoolExecutor for parallel file downloads
             completed_count = 0
