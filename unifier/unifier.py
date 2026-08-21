@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import subprocess
@@ -18,6 +19,31 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_date(value: Any, field: str) -> Optional[str]:
+    """Coerce a date input into the `YYYY-MM-DD` string the API expects.
+
+    Accepts `None` (passed through), a `datetime.date`/`datetime.datetime`, or a
+    string already in `YYYY-MM-DD` form.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date().isoformat()
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str):
+        try:
+            return datetime.datetime.strptime(value.strip(), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            raise ValueError(
+                f"{field} must be in YYYY-MM-DD format, got {value!r}"
+            ) from None
+    raise TypeError(
+        f"{field} must be a date or a YYYY-MM-DD string, got {type(value).__name__}"
+    )
+
+
 class Unifier:
     """Client helpers to interact with the Unifier API.
 
@@ -33,7 +59,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.21'
+    __version__ = '0.1.22'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -131,6 +157,101 @@ class Unifier:
             return response.json()
         except requests.exceptions.RequestException as e:
             logger.error("Unifier list-data-catalog request failed: %s", e)
+            return []
+
+    @classmethod
+    def list_entitled_datasets(
+        cls,
+        date: Optional[Any] = None,
+        from_date: Optional[Any] = None,
+        to_date: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve the datasets the user is entitled to.
+
+        With no arguments this returns the datasets entitled right now. Pass
+        `date` for a single day, or `from_date`/`to_date` for a range. A dataset
+        is included when its entitlement window overlaps the window asked about.
+
+        Parameters
+        ----------
+        date : Optional[str | datetime.date]
+            A single day to check. Cannot be combined with `from_date` or
+            `to_date`.
+        from_date : Optional[str | datetime.date]
+            Start of an inclusive range. Given on its own, matches entitlements
+            active on or after this date.
+        to_date : Optional[str | datetime.date]
+            End of an inclusive range. Given on its own, matches entitlements
+            active on or before this date.
+
+        Returns
+        -------
+        list[dict]
+            Dataset metadata objects sorted by `unifier_source_name`. Returns an
+            empty list on error.
+
+        Raises
+        ------
+        ValueError
+            If `date` is combined with a range, a date is not `YYYY-MM-DD`, or
+            `from_date` is later than `to_date`.
+
+        Notes
+        -----
+        Only datasets that are currently live are returned, including for
+        historical dates. A dataset retired since then will not appear even if
+        the entitlement was active at the time.
+        """
+        if date is not None and (from_date is not None or to_date is not None):
+            raise ValueError(
+                "'date' cannot be combined with 'from_date' or 'to_date'"
+            )
+
+        _date = _normalize_date(date, "date")
+        _from_date = _normalize_date(from_date, "from_date")
+        _to_date = _normalize_date(to_date, "to_date")
+
+        if _from_date and _to_date and _from_date > _to_date:
+            raise ValueError(
+                f"from_date ({_from_date}) cannot be later than to_date ({_to_date})"
+            )
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "user": cls.user,
+            "token": cls.token,
+        }
+        # Omit unset date fields entirely so the server applies its own default.
+        if _date:
+            payload["date"] = _date
+        if _from_date:
+            payload["from_date"] = _from_date
+        if _to_date:
+            payload["to_date"] = _to_date
+
+        _url = cls.url + "/list-entitled-datasets"
+        try:
+            response = requests.post(_url, headers=headers, json=payload)
+            if response.status_code != 200:
+                try:
+                    err = response.json()
+                except ValueError:
+                    err = {}
+                detail = None
+                if isinstance(err, dict):
+                    detail = err.get("error") or err.get("detail")
+                if detail:
+                    logger.warning("Unifier list-entitled-datasets error: %s", detail)
+                else:
+                    logger.warning(
+                        "Unifier list-entitled-datasets failed with status code %s",
+                        response.status_code,
+                    )
+                return []
+
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error("Unifier list-entitled-datasets request failed: %s", e)
             return []
 
     @classmethod
