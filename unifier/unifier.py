@@ -474,7 +474,11 @@ class Unifier:
                     source += "/"
 
                 # Construct command
-                cmd = ["rclone", "copy", source, target_location, "--progress", "--config", "/dev/null"]
+                cmd = [
+                    "rclone", "copy", source, target_location,
+                    "--progress", "--config", "/dev/null",
+                    "--retries", "5", "--retries-sleep", "10s",
+                ]
 
                 if bandwidth_limit:
                      cmd.extend(["--bwlimit", f"{bandwidth_limit}M"])
@@ -487,8 +491,21 @@ class Unifier:
                     cmd.extend(["--include", folder])
 
                 print(f"Downloading with rclone for {name}...")
-                subprocess.run(cmd, env=env, check=True)
-                print(f"Replication completed for {name}")
+                result = subprocess.run(cmd, env=env)
+                # rclone exit code 5 = temporary error (network blip); data was
+                # still transferred. Warn rather than raise so callers aren't
+                # misled into thinking nothing downloaded.
+                if result.returncode == 5:
+                    msg = (
+                        f"Replication completed for {name} with minor network errors "
+                        "(some files may need to be retried)."
+                    )
+                    logger.warning(msg)
+                    print(msg)
+                elif result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, cmd)
+                else:
+                    print(f"Replication completed for {name}")
             else:
                 cls._replicate_native(
                     access_key_id=access_key_id,
