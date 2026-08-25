@@ -44,6 +44,26 @@ def _normalize_date(value: Any, field: str) -> Optional[str]:
     )
 
 
+def _apply_catalog_scope(
+    payload: Dict[str, Any],
+    show_all_datasets: bool,
+    product_type: Optional[str],
+) -> None:
+    """Add the public-display options to a data catalog request payload.
+
+    Fields left unset are omitted from the payload entirely.
+    """
+    if product_type and not show_all_datasets:
+        logger.warning(
+            "product_type=%r has no effect unless show_all_datasets is True",
+            product_type,
+        )
+    if show_all_datasets:
+        payload["show_all_datasets"] = True
+    if product_type:
+        payload["product_type"] = product_type
+
+
 class Unifier:
     """Client helpers to interact with the Unifier API.
 
@@ -59,7 +79,7 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.22'
+    __version__ = '0.1.23'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -126,8 +146,22 @@ class Unifier:
         return cls.get_asof_dates_query(name)
 
     @classmethod
-    def list_data_catalog(cls) -> List[Dict[str, Any]]:
-        """Retrieve all available datasets the user is entitled to see.
+    def list_data_catalog(
+        cls,
+        show_all_datasets: bool = False,
+        product_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve the datasets the user is entitled to see.
+
+        Parameters
+        ----------
+        show_all_datasets : bool
+            When True, publicly available datasets are returned in addition to
+            the ones you are entitled to. Defaults to False.
+        product_type : Optional[str]
+            Limit the publicly available datasets to a single product. Your
+            entitled datasets are always returned regardless of product, so
+            this has no effect unless `show_all_datasets` is True.
 
         Returns
         -------
@@ -139,6 +173,7 @@ class Unifier:
             "user": cls.user,
             "token": cls.token,
         }
+        _apply_catalog_scope(payload, show_all_datasets, product_type)
 
         _url = cls.url + "/list-data-catalogs"
         try:
@@ -255,13 +290,24 @@ class Unifier:
             return []
 
     @classmethod
-    def get_dataset_details(cls, name: str) -> Dict[str, Any]:
+    def get_dataset_details(
+        cls,
+        name: str,
+        show_all_datasets: bool = False,
+        product_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Retrieve detailed metadata for a specific dataset.
 
         Parameters
         ----------
         name : str
             The dataset name.
+        show_all_datasets : bool
+            When True, the dataset is also returned if it is publicly
+            available, even without an entitlement for it. Defaults to False.
+        product_type : Optional[str]
+            Limit the publicly available datasets to a single product. Has no
+            effect unless `show_all_datasets` is True.
 
         Returns
         -------
@@ -274,6 +320,7 @@ class Unifier:
             "user": cls.user,
             "token": cls.token,
         }
+        _apply_catalog_scope(payload, show_all_datasets, product_type)
 
         _url = cls.url + "/data-catalog"
         try:

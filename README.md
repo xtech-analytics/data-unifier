@@ -44,13 +44,28 @@ print(df.head())
 dates_df = unifier.get_asof_dates(name='dataset_name')
 print(dates_df.head())
 
-# List all available datasets in the catalog
+# List the datasets in the catalog you are entitled to
 datasets = unifier.list_data_catalog()
 print(datasets)
+
+# Include publicly available datasets alongside your entitled ones
+all_datasets = unifier.list_data_catalog(show_all_datasets=True)
+
+# Optionally limit the public datasets to a single product
+product_datasets = unifier.list_data_catalog(
+    show_all_datasets=True,
+    product_type='product_name'
+)
 
 # Get detailed metadata for a specific dataset
 details = unifier.get_dataset_details(name='dataset_name')
 print(details)
+
+# Look up a dataset you have no entitlement for, if it is publicly displayed
+public_details = unifier.get_dataset_details(
+    name='dataset_name',
+    show_all_datasets=True
+)
 
 # List the datasets you are entitled to right now
 entitled = unifier.list_entitled_datasets()
