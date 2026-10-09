@@ -1,4 +1,5 @@
 import datetime
+import itertools
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ import re
 import subprocess
 import shutil
 import urllib3.exceptions
+from ijson.backends import yajl2_c
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import urljoin
 import fnmatch
@@ -56,6 +58,21 @@ class _BodyStream:
         self.payload = payload
         self.location = None
 
+    def abandon(self):
+        # A front ended this body without completing it (abandonment,
+        # interpretation failure, or a spec violation): clean up the
+        # long-polled location explicitly — nested-generator cleanup via
+        # GC is unreliable (ijson's Cython objects are cycle-collected) —
+        # and clear it so the delayed inner cleanup cannot delete twice.
+        # Not for transport real errors: the transport already sent its
+        # cleanup DELETE before raising.
+        if self.location is not None:
+            self.client._cleanup_delete(
+                self.location,
+                "Unifier query long-poll abandoned before completion",
+            )
+            self.location = None
+
     def __iter__(self):
         pool = urllib3.PoolManager()
         headers = {"Content-Type": "application/json"}
@@ -93,11 +110,13 @@ class _BodyStream:
                 # The consumer abandoned the stream mid-long-poll: the
                 # location is an incomplete resource, so clean it up like
                 # any other incomplete query. (GeneratorExit must be
-                # re-raised after cleanup.)
-                self.client._cleanup_delete(
-                    self.location,
-                    "Unifier query long-poll abandoned before completion",
-                )
+                # re-raised after cleanup.) Skipped when a front has
+                # already abandoned explicitly (location cleared).
+                if self.location is not None:
+                    self.client._cleanup_delete(
+                        self.location,
+                        "Unifier query long-poll abandoned before completion",
+                    )
                 raise
             return
 
@@ -137,6 +156,44 @@ class _BodyStream:
             raise _BodyError() from e
         finally:
             response.close()
+
+
+class _BodyFile:
+    # File-like adapter over a byte-piece iterable (a _BodyStream) for the
+    # ijson parsers, which pull via read(amt). Each read serves from the
+    # buffer and, when the buffer is empty, pulls at most one new piece
+    # (short reads are legal and ijson tolerates them, so pieces are never
+    # aggregated and pacing stays the transport's). `pulled` snapshots
+    # every byte taken from the piece source, so a new adapter can replay
+    # what an abandoned probe pass (the stream root check) consumed.
+
+    def __init__(self, pieces):
+        self._pieces = iter(pieces)
+        self._buf = b""
+        self._eof = False
+        self.pulled = b""
+
+    def read(self, amt=-1):
+        if not self._buf and not self._eof:
+            try:
+                piece = next(self._pieces)
+            except StopIteration:
+                self._eof = True
+            else:
+                self._buf = piece
+                self.pulled += piece
+        if amt == -1:
+            data, self._buf = self._buf, b""
+        else:
+            data = self._buf[:amt]
+            self._buf = self._buf[amt:]
+        return data
+
+    def detach(self):
+        # Drop the piece-source reference: an abandoned probe pass (its
+        # ijson object has no close and may be cycle-collected) must not
+        # pin the byte generator and delay the abandonment cleanup DELETE.
+        self._pieces = iter(())
 
 
 def _normalize_date(value: Any, field: str) -> Optional[str]:
@@ -209,7 +266,7 @@ class Unifier:
     _wait_level = 0
     _clean_queries = 0
 
-    __version__ = '0.1.23'
+    __version__ = '0.1.24'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -523,7 +580,58 @@ class Unifier:
             dicts). Returns an empty list on error.
         """
 
-        headers = {"Content-Type": "application/json"}
+        payload = cls._query_payload(
+            name, user, token, key, keys, as_of, back_to, up_to,
+            asof_date, asof_back_to, limit, column_filters, disable_view,
+            client_version,
+        )
+
+        stream = cls._body_stream(payload)
+        try:
+            body = b"".join(stream)
+        except _BodyError:
+            # The transport already logged the failure (and sent its
+            # cleanup DELETE for the long-poll path).
+            return []
+        try:
+            response_data = json.loads(body)
+        except ValueError as e:
+            # Delivered bytes are not JSON: same outcome and log as ever,
+            # plus post-202 cleanup when the body came from a Location.
+            message = f"Unifier query request failed: {e}"
+            if stream.location is not None:
+                cls._cleanup_delete(stream.location, message)
+            else:
+                logger.error(message)
+            return []
+        if not isinstance(response_data, list):
+            message = f"Unexpected query response format: {type(response_data)!r}"
+            if stream.location is not None:
+                cls._cleanup_delete(stream.location, message)
+            else:
+                logger.warning(message)
+            return []
+        return response_data
+
+    @classmethod
+    def _query_payload(
+        cls,
+        name: str,
+        user: Optional[str],
+        token: Optional[str],
+        key: Optional[str],
+        keys: Optional[Sequence[str]],
+        as_of: Optional[str],
+        back_to: Optional[str],
+        up_to: Optional[str],
+        asof_date: Optional[str],
+        asof_back_to: Optional[str],
+        limit: Optional[int],
+        column_filters: Optional[str],
+        disable_view: bool,
+        client_version: Optional[str],
+    ) -> Dict[str, Any]:
+        # The query wire payload, shared by query() and stream().
         payload: Dict[str, Any] = {
             "name": name,
             "user": cls.user,
@@ -562,37 +670,12 @@ class Unifier:
         if asof_date is not None:
             payload["asof_date"] = asof_date
 
-        stream = cls._body_stream(payload)
-        try:
-            body = b"".join(stream)
-        except _BodyError:
-            # The transport already logged the failure (and sent its
-            # cleanup DELETE for the long-poll path).
-            return []
-        try:
-            response_data = json.loads(body)
-        except ValueError as e:
-            # Delivered bytes are not JSON: same outcome and log as ever,
-            # plus post-202 cleanup when the body came from a Location.
-            message = f"Unifier query request failed: {e}"
-            if stream.location is not None:
-                cls._cleanup_delete(stream.location, message)
-            else:
-                logger.error(message)
-            return []
-        if not isinstance(response_data, list):
-            message = f"Unexpected query response format: {type(response_data)!r}"
-            if stream.location is not None:
-                cls._cleanup_delete(stream.location, message)
-            else:
-                logger.warning(message)
-            return []
-        return response_data
+        return payload
 
     @classmethod
     def _body_stream(cls, payload: Dict[str, Any]) -> _BodyStream:
-        # The body-byte transport for query(): one stream that owns the
-        # 200/202 dispatch (see _BodyStream).
+        # The body-byte transport for query() and stream(): one stream that
+        # owns the 200/202 dispatch (see _BodyStream).
         return _BodyStream(cls, payload)
 
     @classmethod
@@ -826,6 +909,110 @@ class Unifier:
             {k: v for d in item for k, v in d.items()} for item in json_result
         ]
         return extracted_data
+
+    @classmethod
+    def stream(
+        cls,
+        name: str,
+        user: Optional[str] = None,
+        token: Optional[str] = None,
+        key: Optional[str] = None,
+        keys: Optional[Sequence[str]] = None,
+        as_of: Optional[str] = None,
+        back_to: Optional[str] = None,
+        up_to: Optional[str] = None,
+        asof_date: Optional[str] = None,
+        asof_back_to: Optional[str] = None,
+        limit: Optional[int] = None,
+        column_filters: Optional[str] = None,
+        disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """Stream the query result row by row as it arrives.
+
+        Same parameters and same transport as query() (including the 202
+        long-poll path and its salvage/backoff machinery), but rows are
+        yielded as soon as each one completes instead of waiting for the
+        whole body: a front can watch the response roll in as the server
+        publishes it. Parsing is incremental (ijson, yajl2_c C backend
+        confirmed at import: no fallback) and numbers are floats, matching
+        json.loads, so rows carry identical value types to query().
+
+        Each yielded row is the row's list of fragment dicts, exactly as
+        query() returns them; merge fragments as get_dataframe does if a
+        flat record is wanted. There is no yield before the first complete
+        row.
+
+        Yields
+        ------
+        list[dict]
+            One row (a list of fragment dicts) per yield.
+
+        Raises
+        ------
+        ValueError
+            The response root is not the query list (a conforming server
+            always sends the list; items() alone would silently yield
+            nothing for other roots).
+        _BodyError
+            The body transport failed (already logged; the long-poll path
+            also sent its cleanup DELETE).
+        IncompleteJSONError
+            The delivered bytes ended before the JSON document did.
+
+        Abandoning the generator mid-stream sends the cleanup DELETE to a
+        long-polled location, just like any other incomplete query.
+        """
+        payload = cls._query_payload(
+            name, user, token, key, keys, as_of, back_to, up_to,
+            asof_date, asof_back_to, limit, column_filters, disable_view,
+            client_version,
+        )
+        body = cls._body_stream(payload)
+        pieces = iter(body)
+        # Cleanup is explicit on every exit path: cleanup via nested
+        # generator GC is unreliable (ijson's Cython objects are
+        # cycle-collected), so stream() owns the DELETE and the transport
+        # generator's unwinding itself.
+        try:
+            # Root contract: items() over a non-array root yields nothing
+            # and no error, so the root is verified from the first parse
+            # event. The probe adapter snapshots what the probe consumed;
+            # the items pass replays the snapshot, then continues the same
+            # byte generator. The probe adapter is detached after: the
+            # probe's ijson object has no close() and may be
+            # cycle-collected, so it must not pin the byte generator.
+            probe = _BodyFile(pieces)
+            first = next(yajl2_c.parse(probe), None)
+            probe.detach()
+            if first is None or first[0] != "" or first[1] != "start_array":
+                raise ValueError(f"Unexpected stream response root: {first!r}")
+            f = _BodyFile(itertools.chain([probe.pulled], pieces))
+            for row in yajl2_c.items(f, "item", use_float=True):
+                yield row
+            # The document is fully parsed, but the transport generator is
+            # still suspended at its final yield: drain it so its
+            # completion bookkeeping (sticky wait level, rampup) runs.
+            for _ in pieces:
+                pass
+            # Completed: the resource is finished, nothing to clean up.
+            body.location = None
+        except GeneratorExit:
+            body.abandon()
+            raise
+        except _BodyError:
+            raise  # transport real error: already logged and DELETEd
+        except Exception:
+            # Interpretation/spec failure (ValueError root,
+            # IncompleteJSONError truncation): the location is an
+            # incomplete or unusable resource — clean it up.
+            body.abandon()
+            raise
+        finally:
+            # Unwind the transport generator promptly no matter how the
+            # stream ends: it closes its in-flight response; its own
+            # cleanup sees a cleared location, so it cannot delete twice.
+            pieces.close()
 
     @classmethod
     def replicate(
