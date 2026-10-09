@@ -1,9 +1,12 @@
 import datetime
+import json
 import logging
 import os
+import re
 import subprocess
 import shutil
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import urljoin
 import fnmatch
 from concurrent.futures import ThreadPoolExecutor
 
@@ -18,6 +21,11 @@ except ImportError:
     TransferConfig = None
 
 logger = logging.getLogger(__name__)
+
+# Sentinel default for client_version: send this client's actual version.
+# A caller-supplied string is sent as-is; explicit None opts out entirely
+# (no client_version field is sent).
+_AUTO_CLIENT_VERSION = object()
 
 
 def _normalize_date(value: Any, field: str) -> Optional[str]:
@@ -78,6 +86,17 @@ class Unifier:
     url = 'https://unifier.x-tech.ai/unifier'
     user = ''
     token = ''
+
+    # Long-poll Prefer: wait backoff (seconds), longest first. An error on
+    # the post-202 GET path steps down one level; the level is sticky for
+    # the process (not persisted) and climbs back one level every `rampup`
+    # error-free queries. `wait`, when set, caps the sequence: it becomes
+    # the longest value and only lower stock values apply.
+    BACKOFF_WAITS = (86400, 3600, 900, 300, 30, 15, 5, 1)
+    wait = None
+    rampup = 10
+    _wait_level = 0
+    _clean_queries = 0
 
     __version__ = '0.1.23'
 
@@ -357,6 +376,7 @@ class Unifier:
         limit: Optional[int] = None,
         column_filters: Optional[str] = None,
         disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
     ) -> List[Sequence[Dict[str, Any]]]:
         """Query the Unifier API and return the raw response data as-is.
 
@@ -380,6 +400,10 @@ class Unifier:
             SQL-compatible boolean expression to filter columns/rows server-side.
         disable_view : bool
             If true, disable view expansion on the server.
+        client_version : Optional[str]
+            Client version string sent with the request. Defaults to this
+            client's actual version; a caller-supplied string is sent
+            as-is; explicit None sends no client_version field.
 
         Returns
         -------
@@ -395,6 +419,11 @@ class Unifier:
             "token": cls.token,
             "disable_view": disable_view,
         }
+
+        if client_version is not None:
+            if client_version is _AUTO_CLIENT_VERSION:
+                client_version = cls.__version__
+            payload["client_version"] = client_version
 
         if limit is not None:
             payload["limit"] = limit
@@ -422,9 +451,36 @@ class Unifier:
         if asof_date is not None:
             payload["asof_date"] = asof_date
 
+        location = None
         try:
             response = requests.post(cls.url, headers=headers, json=payload)
-            if response.status_code != 200:
+            if response.status_code == 202:
+                # Accepted: the response is forming at the Location resource
+                # (a generic id, not a file). Assemble it with Range GETs
+                # until Content-Range reports a known complete length, then
+                # interpret the assembled body through the same path as a
+                # 200 response.
+                location = response.headers.get("Location")
+                if not location:
+                    logger.warning(
+                        "Unifier query 202 response missing Location header"
+                    )
+                    return []
+                # Location is a relative reference: resolve it against the
+                # request URL that produced the 202, never against a
+                # configured base url.
+                location = urljoin(response.url, location)
+                body = cls._range_poll(location)
+                if body is None:
+                    return []
+                try:
+                    response_data = json.loads(body)
+                except ValueError as e:
+                    # Delivered bytes are not JSON: same outcome and log as
+                    # a 200 whose body fails to parse, plus post-202 cleanup.
+                    cls._cleanup_delete(location, f"Unifier query request failed: {e}")
+                    return []
+            elif response.status_code != 200:
                 try:
                     err = response.json()
                 except ValueError:
@@ -437,14 +493,125 @@ class Unifier:
                     "Unifier query failed with status code %s", response.status_code
                 )
                 return []
-            response_data = response.json()
+            else:
+                response_data = response.json()
             if not isinstance(response_data, list):
-                logger.warning("Unexpected query response format: %r", type(response_data))
+                message = f"Unexpected query response format: {type(response_data)!r}"
+                if location is not None:
+                    cls._cleanup_delete(location, message)
+                else:
+                    logger.warning(message)
                 return []
             return response_data
         except requests.exceptions.RequestException as e:
             logger.error("Unifier query request failed: %s", e)
             return []
+
+    @classmethod
+    def _wait_sequence(cls) -> Sequence[int]:
+        if cls.wait is None:
+            return cls.BACKOFF_WAITS
+        return (cls.wait,) + tuple(v for v in cls.BACKOFF_WAITS if v < cls.wait)
+
+    @classmethod
+    def _cleanup_delete(cls, location: str, message: str) -> None:
+        # Real error post-202: best-effort DELETE cleanup. We do not care
+        # whether it succeeds; a failed DELETE is appended info on the
+        # error we already have, never a new error. The server's own
+        # cleanup does not strictly depend on this DELETE arriving.
+        cleanup = ""
+        try:
+            response = requests.delete(location)
+            if not 200 <= response.status_code < 300:
+                cleanup = (
+                    f"; cleanup DELETE failed with status code {response.status_code}"
+                )
+        except requests.exceptions.RequestException as e:
+            cleanup = f"; cleanup DELETE failed: {e}"
+        logger.warning("%s%s", message, cleanup)
+
+    @classmethod
+    def _range_poll(cls, location: str) -> Optional[bytes]:
+        # Long-poll a 202-formed response: open-ended Range GETs from the
+        # next unread byte, with Prefer: wait=<seconds> so the server can
+        # hold each request until more bytes exist. 204 means nothing new
+        # yet (re-request the same cursor). Any other GET error steps down
+        # the sticky backoff sequence one level and re-requests the same
+        # cursor; an error while already at the shortest wait is a real
+        # error. Malformed Content-Range or a chunk gap is a real error too
+        # (re-requesting would return the same bad bytes). Real errors send
+        # a best-effort DELETE to the location before failing out.
+        # Intermediate 206s carry Content-Range "bytes x-y/*" (total
+        # unknown); the response is complete once a numeric total is
+        # reported and fully received. Returns the assembled body bytes,
+        # or None on failure; the caller interprets the body through the
+        # same path as a 200 response.
+        seq = cls._wait_sequence()
+        level = cls._wait_level
+        offset = 0
+        chunks: List[bytes] = []
+        while True:
+            headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={seq[level]}"}
+            error_detail = None
+            try:
+                response = requests.get(location, headers=headers)
+            except requests.exceptions.RequestException as e:
+                error_detail = str(e)
+                response = None
+            if response is not None and response.status_code == 204:
+                # Nothing new yet: ignore and re-request the same range
+                # cursor. The loop builds each Range from `offset`, which
+                # only advances on a 206, so `continue` re-asks for the
+                # same open-ended byte range.
+                continue
+            if response is None or response.status_code != 206:
+                if level + 1 < len(seq):
+                    # Back off one wait level and re-request the same
+                    # cursor; a step-down also resets rampup progress.
+                    level += 1
+                    cls._clean_queries = 0
+                    continue
+                detail = error_detail or f"status code {response.status_code}"
+                cls._wait_level = level
+                cls._cleanup_delete(
+                    location,
+                    f"Unifier query long-poll failed with {detail}"
+                    f" at minimum wait {seq[level]}",
+                )
+                return None
+            content_range = response.headers.get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range.strip())
+            if not match:
+                cls._wait_level = level
+                cls._cleanup_delete(
+                    location,
+                    f"Unifier query long-poll bad Content-Range: {content_range!r}",
+                )
+                return None
+            start = int(match.group(1))
+            end = int(match.group(2))
+            complete = match.group(3)
+            if start != offset:
+                cls._wait_level = level
+                cls._cleanup_delete(
+                    location,
+                    f"Unifier query long-poll chunk gap: got start {start},"
+                    f" expected {offset}",
+                )
+                return None
+            chunks.append(response.content)
+            offset = end + 1
+            if complete != "*" and offset >= int(complete):
+                break
+        # Success: the level is sticky; every `rampup` error-free queries
+        # at a backed-off level climbs one level back up.
+        cls._wait_level = level
+        if level > 0:
+            cls._clean_queries += 1
+            if cls._clean_queries >= cls.rampup:
+                cls._wait_level = level - 1
+                cls._clean_queries = 0
+        return b"".join(chunks)
 
     @classmethod
     def get_dataframe(
@@ -462,6 +629,7 @@ class Unifier:
         limit: Optional[int] = None,
         column_filters: Optional[str] = None,
         disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
     ) -> pd.DataFrame:
         """Get the query result as a pandas DataFrame.
 
@@ -482,6 +650,7 @@ class Unifier:
             limit,
             column_filters,
             disable_view,
+            client_version=client_version,
         )
         if not json_result:
             return pd.DataFrame()
@@ -506,6 +675,7 @@ class Unifier:
         limit: Optional[int] = None,
         column_filters: Optional[str] = None,
         disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
     ) -> List[Dict[str, Any]]:
         """Get the query result as a flattened JSON list of dicts.
 
@@ -526,6 +696,7 @@ class Unifier:
             limit,
             column_filters,
             disable_view,
+            client_version=client_version,
         )
         if not json_result:
             return []
