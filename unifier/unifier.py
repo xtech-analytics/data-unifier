@@ -6,7 +6,7 @@ import re
 import subprocess
 import shutil
 import urllib3.exceptions
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import urljoin
 import fnmatch
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +27,116 @@ logger = logging.getLogger(__name__)
 # A caller-supplied string is sent as-is; explicit None opts out entirely
 # (no client_version field is sent).
 _AUTO_CLIENT_VERSION = object()
+
+
+class _BodyError(Exception):
+    # Internal: the query body transport failed. The failure has already
+    # been logged at its source (the long-poll path has also sent its
+    # cleanup DELETE); this carries the failure to the consuming front,
+    # which decides what returning it looks like.
+    pass
+
+
+class _BodyStream:
+    # Iterable of raw query-response body bytes, yielding them as they
+    # arrive (urllib3 read1; a hard error if read1 is unavailable, no
+    # fallback). The 200/202 decision happens inside the transport, based
+    # on what the server answers: a direct 200 streams its own body; a 202
+    # streams the long-polled Location resource with the backoff/salvage
+    # machinery. `location` records where the body came from (None for a
+    # direct 200) so a front can clean up after interpretation failures
+    # without knowing which path the transport took. A future front can
+    # consume these bytes with a different interpretation than query().
+    # A consumer that abandons a long-polled stream mid-way sends the
+    # cleanup DELETE to its location (GeneratorExit), just like a real
+    # transport failure does.
+
+    def __init__(self, client, payload):
+        self.client = client
+        self.payload = payload
+        self.location = None
+
+    def __iter__(self):
+        pool = urllib3.PoolManager()
+        headers = {"Content-Type": "application/json"}
+        try:
+            response = pool.request(
+                "POST",
+                self.client.url,
+                body=json.dumps(self.payload).encode(),
+                headers=headers,
+                retries=0,
+                preload_content=False,
+            )
+        except urllib3.exceptions.HTTPError as e:
+            logger.error("Unifier query request failed: %s", e)
+            raise _BodyError() from e
+
+        if response.status == 202:
+            # Accepted: the response is forming at the Location resource
+            # (a generic id, not a file). Location is a relative reference:
+            # resolve it against the request URL that produced the 202,
+            # never against a configured base url. retries=0 means no
+            # redirect following, so the POST URL is exactly that request
+            # URL (urllib3's response.url is not the full URL here).
+            location = response.headers.get("Location")
+            response.close()
+            if not location:
+                logger.warning(
+                    "Unifier query 202 response missing Location header"
+                )
+                raise _BodyError()
+            self.location = urljoin(self.client.url, location)
+            try:
+                yield from self.client._range_poll(pool, self.location)
+            except GeneratorExit:
+                # The consumer abandoned the stream mid-long-poll: the
+                # location is an incomplete resource, so clean it up like
+                # any other incomplete query. (GeneratorExit must be
+                # re-raised after cleanup.)
+                self.client._cleanup_delete(
+                    self.location,
+                    "Unifier query long-poll abandoned before completion",
+                )
+                raise
+            return
+
+        if response.status != 200:
+            # A transport cut of the error body is transport interference,
+            # not a server bug (which would fail loudly): treat it like an
+            # unparseable error body and fall to the status-code log.
+            try:
+                body = response.read()
+            except urllib3.exceptions.HTTPError:
+                body = b""
+            response.close()
+            try:
+                err = json.loads(body)
+            except ValueError:
+                err = {}
+            if isinstance(err, dict) and "error" in err:
+                logger.warning("Unifier query error: %s", err["error"])
+                raise _BodyError()
+
+            logger.warning(
+                "Unifier query failed with status code %s", response.status
+            )
+            raise _BodyError()
+
+        # 200: stream the response body as it arrives. A cut on the direct
+        # body has no cursor to advance (that is the long-poll path's
+        # salvage), so it fails the query like any other transport error.
+        try:
+            while True:
+                piece = response.read1(65536)
+                if not piece:
+                    break
+                yield piece
+        except urllib3.exceptions.HTTPError as e:
+            logger.error("Unifier query request failed: %s", e)
+            raise _BodyError() from e
+        finally:
+            response.close()
 
 
 def _normalize_date(value: Any, field: str) -> Optional[str]:
@@ -452,61 +562,38 @@ class Unifier:
         if asof_date is not None:
             payload["asof_date"] = asof_date
 
-        location = None
+        stream = cls._body_stream(payload)
         try:
-            response = requests.post(cls.url, headers=headers, json=payload)
-            if response.status_code == 202:
-                # Accepted: the response is forming at the Location resource
-                # (a generic id, not a file). Assemble it with Range GETs
-                # until Content-Range reports a known complete length, then
-                # interpret the assembled body through the same path as a
-                # 200 response.
-                location = response.headers.get("Location")
-                if not location:
-                    logger.warning(
-                        "Unifier query 202 response missing Location header"
-                    )
-                    return []
-                # Location is a relative reference: resolve it against the
-                # request URL that produced the 202, never against a
-                # configured base url.
-                location = urljoin(response.url, location)
-                body = cls._range_poll(location)
-                if body is None:
-                    return []
-                try:
-                    response_data = json.loads(body)
-                except ValueError as e:
-                    # Delivered bytes are not JSON: same outcome and log as
-                    # a 200 whose body fails to parse, plus post-202 cleanup.
-                    cls._cleanup_delete(location, f"Unifier query request failed: {e}")
-                    return []
-            elif response.status_code != 200:
-                try:
-                    err = response.json()
-                except ValueError:
-                    err = {}
-                if isinstance(err, dict) and "error" in err:
-                    logger.warning("Unifier query error: %s", err["error"])
-                    return []
-
-                logger.warning(
-                    "Unifier query failed with status code %s", response.status_code
-                )
-                return []
-            else:
-                response_data = response.json()
-            if not isinstance(response_data, list):
-                message = f"Unexpected query response format: {type(response_data)!r}"
-                if location is not None:
-                    cls._cleanup_delete(location, message)
-                else:
-                    logger.warning(message)
-                return []
-            return response_data
-        except requests.exceptions.RequestException as e:
-            logger.error("Unifier query request failed: %s", e)
+            body = b"".join(stream)
+        except _BodyError:
+            # The transport already logged the failure (and sent its
+            # cleanup DELETE for the long-poll path).
             return []
+        try:
+            response_data = json.loads(body)
+        except ValueError as e:
+            # Delivered bytes are not JSON: same outcome and log as ever,
+            # plus post-202 cleanup when the body came from a Location.
+            message = f"Unifier query request failed: {e}"
+            if stream.location is not None:
+                cls._cleanup_delete(stream.location, message)
+            else:
+                logger.error(message)
+            return []
+        if not isinstance(response_data, list):
+            message = f"Unexpected query response format: {type(response_data)!r}"
+            if stream.location is not None:
+                cls._cleanup_delete(stream.location, message)
+            else:
+                logger.warning(message)
+            return []
+        return response_data
+
+    @classmethod
+    def _body_stream(cls, payload: Dict[str, Any]) -> _BodyStream:
+        # The body-byte transport for query(): one stream that owns the
+        # 200/202 dispatch (see _BodyStream).
+        return _BodyStream(cls, payload)
 
     @classmethod
     def _wait_sequence(cls) -> Sequence[int]:
@@ -532,34 +619,31 @@ class Unifier:
         logger.warning("%s%s", message, cleanup)
 
     @classmethod
-    def _range_poll(cls, location: str) -> Optional[bytes]:
+    def _range_poll(cls, pool, location: str) -> Iterator[bytes]:
         # Long-poll a 202-formed response: open-ended Range GETs from the
         # next unread byte, with Prefer: wait=<seconds> so the server can
         # hold each request until more bytes exist. The GETs use urllib3
-        # directly (no retries: this loop owns retrying) so the 206 body
-        # is collected as it streams: a transport failure (not an HTTP
-        # error) that cuts the stream mid-body keeps the bytes already
-        # read as data, and the retry advances the range cursor past them
-        # instead of re-requesting the same range — a response that was
-        # progressing toward 206 but cut by a proxy or MITM still
-        # contributes. 204 means nothing new yet (re-request the same
-        # cursor). Any other GET error steps down the sticky backoff
-        # sequence one level; an error while already at the shortest wait
-        # is a real error and sends a best-effort DELETE to the location
-        # before failing out. The server conforms to the protocol spec,
-        # so Content-Range is trusted and never validated: a
-        # non-conforming value is a hard error (the parse fails loudly),
-        # not handled — consistent with the no-fallback read1 policy.
-        # Intermediate 206s carry Content-Range "bytes x-y/*" (total
-        # unknown); the response is complete once a numeric total is
-        # reported and fully received. Returns the assembled body bytes,
-        # or None on failure; the caller interprets the body through the
-        # same path as a 200 response.
-        pool = urllib3.PoolManager()
+        # directly (no retries: this loop owns retrying) and yield the 206
+        # body as it streams: a transport failure (not an HTTP error) that
+        # cuts the stream mid-body keeps the bytes already read as data,
+        # and the retry advances the range cursor past them instead of
+        # re-requesting the same range — a response that was progressing
+        # toward 206 but cut by a proxy or MITM still contributes. 204
+        # means nothing new yet (re-request the same cursor). Any other
+        # GET error steps down the sticky backoff sequence one level; an
+        # error while already at the shortest wait is a real error and
+        # sends a best-effort DELETE to the location before raising. The
+        # server conforms to the protocol spec, so Content-Range is
+        # trusted and never validated: a non-conforming value is a hard
+        # error (the parse fails loudly), not handled — consistent with
+        # the no-fallback read1 policy. Intermediate 206s carry
+        # Content-Range "bytes x-y/*" (total unknown); the response is
+        # complete once a numeric total is reported and fully received.
+        # Yields the assembled body's bytes; the consuming front joins
+        # and interprets them through the same path as a 200 response.
         seq = cls._wait_sequence()
         level = cls._wait_level
         offset = 0
-        chunks: List[bytes] = []
         while True:
             headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={seq[level]}"}
             http_detail = None
@@ -609,7 +693,7 @@ class Unifier:
                         piece = response.read1(65536)
                         if not piece:
                             break
-                        chunks.append(piece)
+                        yield piece
                         salvaged += len(piece)
                 except urllib3.exceptions.HTTPError as e:
                     transport_detail = str(e)
@@ -641,7 +725,7 @@ class Unifier:
                 f" {transport_detail or http_detail}"
                 f" at minimum wait {seq[level]}",
             )
-            return None
+            raise _BodyError()
         # Success: the level is sticky; every `rampup` error-free queries
         # at a backed-off level climbs one level back up.
         cls._wait_level = level
@@ -650,7 +734,6 @@ class Unifier:
             if cls._clean_queries >= cls.rampup:
                 cls._wait_level = level - 1
                 cls._clean_queries = 0
-        return b"".join(chunks)
 
     @classmethod
     def get_dataframe(
