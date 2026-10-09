@@ -6,6 +6,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'requests',
+        'urllib3',
         'pandas',
         'boto3',
     ],

@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import shutil
+import urllib3.exceptions
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urljoin
 import fnmatch
@@ -534,75 +535,113 @@ class Unifier:
     def _range_poll(cls, location: str) -> Optional[bytes]:
         # Long-poll a 202-formed response: open-ended Range GETs from the
         # next unread byte, with Prefer: wait=<seconds> so the server can
-        # hold each request until more bytes exist. 204 means nothing new
-        # yet (re-request the same cursor). Any other GET error steps down
-        # the sticky backoff sequence one level and re-requests the same
-        # cursor; an error while already at the shortest wait is a real
-        # error. Malformed Content-Range or a chunk gap is a real error too
-        # (re-requesting would return the same bad bytes). Real errors send
-        # a best-effort DELETE to the location before failing out.
+        # hold each request until more bytes exist. The GETs use urllib3
+        # directly (no retries: this loop owns retrying) so the 206 body
+        # is collected as it streams: a transport failure (not an HTTP
+        # error) that cuts the stream mid-body keeps the bytes already
+        # read as data, and the retry advances the range cursor past them
+        # instead of re-requesting the same range — a response that was
+        # progressing toward 206 but cut by a proxy or MITM still
+        # contributes. 204 means nothing new yet (re-request the same
+        # cursor). Any other GET error steps down the sticky backoff
+        # sequence one level; an error while already at the shortest wait
+        # is a real error and sends a best-effort DELETE to the location
+        # before failing out. The server conforms to the protocol spec,
+        # so Content-Range is trusted and never validated: a
+        # non-conforming value is a hard error (the parse fails loudly),
+        # not handled — consistent with the no-fallback read1 policy.
         # Intermediate 206s carry Content-Range "bytes x-y/*" (total
         # unknown); the response is complete once a numeric total is
         # reported and fully received. Returns the assembled body bytes,
         # or None on failure; the caller interprets the body through the
         # same path as a 200 response.
+        pool = urllib3.PoolManager()
         seq = cls._wait_sequence()
         level = cls._wait_level
         offset = 0
         chunks: List[bytes] = []
         while True:
             headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={seq[level]}"}
-            error_detail = None
+            http_detail = None
+            transport_detail = None
+            response = None
+            salvaged = 0
+            total = None
             try:
-                response = requests.get(location, headers=headers)
-            except requests.exceptions.RequestException as e:
-                error_detail = str(e)
-                response = None
-            if response is not None and response.status_code == 204:
+                response = pool.request(
+                    "GET",
+                    location,
+                    headers=headers,
+                    retries=0,
+                    preload_content=False,
+                )
+            except urllib3.exceptions.HTTPError as e:
+                transport_detail = str(e)
+
+            if response is not None and response.status == 204:
                 # Nothing new yet: ignore and re-request the same range
                 # cursor. The loop builds each Range from `offset`, which
-                # only advances on a 206, so `continue` re-asks for the
-                # same open-ended byte range.
+                # only advances when bytes arrive, so `continue` re-asks
+                # for the same open-ended byte range.
+                response.close()
                 continue
-            if response is None or response.status_code != 206:
-                if level + 1 < len(seq):
-                    # Back off one wait level and re-request the same
-                    # cursor; a step-down also resets rampup progress.
-                    level += 1
-                    cls._clean_queries = 0
+
+            if response is not None and response.status != 206:
+                # HTTP-level error: no body is collected from it.
+                http_detail = f"status code {response.status}"
+                response.close()
+            elif response is not None:
+                # 206. Trust the Content-Range the server reports.
+                match = re.fullmatch(
+                    r"bytes (\d+)-(\d+)/(\d+|\*)",
+                    response.headers.get("Content-Range", "").strip(),
+                )
+                end = int(match.group(2))
+                complete = match.group(3)
+                total = int(complete) if complete != "*" else None
+                # Stream the body: read1 returns bytes as they arrive
+                # instead of blocking for the full declared length, so a
+                # transport cut mid-body keeps everything that arrived —
+                # read1 has already returned it by the time it raises.
+                # (urllib3 without read1 is a hard error: no fallback.)
+                try:
+                    while True:
+                        piece = response.read1(65536)
+                        if not piece:
+                            break
+                        chunks.append(piece)
+                        salvaged += len(piece)
+                except urllib3.exceptions.HTTPError as e:
+                    transport_detail = str(e)
+                finally:
+                    response.close()
+                if transport_detail is None:
+                    # The whole declared chunk arrived.
+                    offset = end + 1
+                    if total is not None and offset >= total:
+                        break
                     continue
-                detail = error_detail or f"status code {response.status_code}"
-                cls._wait_level = level
-                cls._cleanup_delete(
-                    location,
-                    f"Unifier query long-poll failed with {detail}"
-                    f" at minimum wait {seq[level]}",
-                )
-                return None
-            content_range = response.headers.get("Content-Range", "")
-            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range.strip())
-            if not match:
-                cls._wait_level = level
-                cls._cleanup_delete(
-                    location,
-                    f"Unifier query long-poll bad Content-Range: {content_range!r}",
-                )
-                return None
-            start = int(match.group(1))
-            end = int(match.group(2))
-            complete = match.group(3)
-            if start != offset:
-                cls._wait_level = level
-                cls._cleanup_delete(
-                    location,
-                    f"Unifier query long-poll chunk gap: got start {start},"
-                    f" expected {offset}",
-                )
-                return None
-            chunks.append(response.content)
-            offset = end + 1
-            if complete != "*" and offset >= int(complete):
-                break
+                # Transport cut mid-body: the bytes read are data; advance
+                # the cursor past them for the retry. If they already reach
+                # the reported total, the cut lost nothing: complete.
+                offset += salvaged
+                if total is not None and offset >= total:
+                    break
+
+            # An error (HTTP-level or transport): back off one wait level
+            # and retry, or fail for real at the minimum wait.
+            if level + 1 < len(seq):
+                level += 1
+                cls._clean_queries = 0
+                continue
+            cls._wait_level = level
+            cls._cleanup_delete(
+                location,
+                f"Unifier query long-poll failed with"
+                f" {transport_detail or http_detail}"
+                f" at minimum wait {seq[level]}",
+            )
+            return None
         # Success: the level is sticky; every `rampup` error-free queries
         # at a backed-off level climbs one level back up.
         cls._wait_level = level
