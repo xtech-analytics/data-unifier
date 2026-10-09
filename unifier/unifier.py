@@ -163,14 +163,17 @@ class _BodyFile:
     # ijson parsers, which pull via read(amt). Each read serves from the
     # buffer and, when the buffer is empty, pulls at most one new piece
     # (short reads are legal and ijson tolerates them, so pieces are never
-    # aggregated and pacing stays the transport's). `pulled` snapshots
-    # every byte taken from the piece source, so a new adapter can replay
-    # what an abandoned probe pass (the stream root check) consumed.
+    # aggregated and pacing stays the transport's). `pulled` (opt-in via
+    # snapshot=True) records every byte taken from the piece source, so a
+    # new adapter can replay what an abandoned probe pass (the stream root
+    # check) consumed; accumulating it over a whole body would copy O(n^2)
+    # bytes, so the items pass never snapshots.
 
-    def __init__(self, pieces):
+    def __init__(self, pieces, snapshot=False):
         self._pieces = iter(pieces)
         self._buf = b""
         self._eof = False
+        self.snapshot = snapshot
         self.pulled = b""
 
     def read(self, amt=-1):
@@ -181,7 +184,8 @@ class _BodyFile:
                 self._eof = True
             else:
                 self._buf = piece
-                self.pulled += piece
+                if self.snapshot:
+                    self.pulled += piece
         if amt == -1:
             data, self._buf = self._buf, b""
         else:
@@ -982,7 +986,7 @@ class Unifier:
             # byte generator. The probe adapter is detached after: the
             # probe's ijson object has no close() and may be
             # cycle-collected, so it must not pin the byte generator.
-            probe = _BodyFile(pieces)
+            probe = _BodyFile(pieces, snapshot=True)
             first = next(yajl2_c.parse(probe), None)
             probe.detach()
             if first is None or first[0] != "" or first[1] != "start_array":
