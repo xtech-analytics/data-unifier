@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import shutil
+import time
 import urllib3.exceptions
 from ijson.backends import yajl2_c
 from typing import Any, Dict, Iterator, List, Optional, Sequence
@@ -57,6 +58,8 @@ class _BodyStream:
         self.client = client
         self.payload = payload
         self.location = None
+        self.pool = None
+        self.conn_epoch = None
 
     def abandon(self):
         # A front ended this body without completing it (abandonment,
@@ -68,13 +71,20 @@ class _BodyStream:
         # cleanup DELETE before raising.
         if self.location is not None:
             self.client._cleanup_delete(
+                self.pool,
                 self.location,
                 "Unifier query long-poll abandoned before completion",
             )
             self.location = None
 
     def __iter__(self):
+        # One pool for the whole query lifecycle: the POST, the long-poll
+        # GETs, and any cleanup DELETE all ride the same connection where
+        # possible.
         pool = urllib3.PoolManager()
+        self.pool = pool
+        # The POST opens the connection; its age budget starts here.
+        self.conn_epoch = self.client._now()
         headers = {"Content-Type": "application/json"}
         try:
             response = pool.request(
@@ -97,7 +107,9 @@ class _BodyStream:
             # redirect following, so the POST URL is exactly that request
             # URL (urllib3's response.url is not the full URL here).
             location = response.headers.get("Location")
-            response.close()
+            # 202 carries an empty body: drain it and return the clean
+            # connection to the pool for the long-poll GETs to reuse.
+            response.drain_conn()
             if not location:
                 logger.warning(
                     "Unifier query 202 response missing Location header"
@@ -105,7 +117,7 @@ class _BodyStream:
                 raise _BodyError()
             self.location = urljoin(self.client.url, location)
             try:
-                yield from self.client._range_poll(pool, self.location)
+                yield from self.client._range_poll(self, self.location)
             except GeneratorExit:
                 # The consumer abandoned the stream mid-long-poll: the
                 # location is an incomplete resource, so clean it up like
@@ -114,6 +126,7 @@ class _BodyStream:
                 # already abandoned explicitly (location cleared).
                 if self.location is not None:
                     self.client._cleanup_delete(
+                        pool,
                         self.location,
                         "Unifier query long-poll abandoned before completion",
                     )
@@ -269,6 +282,14 @@ class Unifier:
     rampup = 10
     _wait_level = 0
     _clean_queries = 0
+
+    # Prefer: wait budgets the CONNECTION too, not just the request: the
+    # wait sent is the current backoff value minus the time the reused
+    # connection has been open; when what is left drops below cycle_pct of
+    # the value, the connection is closed after that request (Connection:
+    # close) and the next one opens fresh at the full value.
+    cycle_pct = 0.2
+    _now = staticmethod(time.monotonic)
 
     __version__ = '0.1.24'
 
@@ -604,14 +625,14 @@ class Unifier:
             # plus post-202 cleanup when the body came from a Location.
             message = f"Unifier query request failed: {e}"
             if stream.location is not None:
-                cls._cleanup_delete(stream.location, message)
+                cls._cleanup_delete(stream.pool, stream.location, message)
             else:
                 logger.error(message)
             return []
         if not isinstance(response_data, list):
             message = f"Unexpected query response format: {type(response_data)!r}"
             if stream.location is not None:
-                cls._cleanup_delete(stream.location, message)
+                cls._cleanup_delete(stream.pool, stream.location, message)
             else:
                 logger.warning(message)
             return []
@@ -689,24 +710,26 @@ class Unifier:
         return (cls.wait,) + tuple(v for v in cls.BACKOFF_WAITS if v < cls.wait)
 
     @classmethod
-    def _cleanup_delete(cls, location: str, message: str) -> None:
-        # Real error post-202: best-effort DELETE cleanup. We do not care
-        # whether it succeeds; a failed DELETE is appended info on the
-        # error we already have, never a new error. The server's own
-        # cleanup does not strictly depend on this DELETE arriving.
+    def _cleanup_delete(cls, pool, location: str, message: str) -> None:
+        # Real error post-202: best-effort DELETE cleanup on the query's
+        # own connection pool (the long-poll connection is reused when
+        # possible). We do not care whether it succeeds; a failed DELETE
+        # is appended info on the error we already have, never a new
+        # error. The server's own cleanup does not strictly depend on this
+        # DELETE arriving.
         cleanup = ""
         try:
-            response = requests.delete(location)
-            if not 200 <= response.status_code < 300:
+            response = pool.request("DELETE", location, retries=0)
+            if not 200 <= response.status < 300:
                 cleanup = (
-                    f"; cleanup DELETE failed with status code {response.status_code}"
+                    f"; cleanup DELETE failed with status code {response.status}"
                 )
-        except requests.exceptions.RequestException as e:
+        except urllib3.exceptions.HTTPError as e:
             cleanup = f"; cleanup DELETE failed: {e}"
         logger.warning("%s%s", message, cleanup)
 
     @classmethod
-    def _range_poll(cls, pool, location: str) -> Iterator[bytes]:
+    def _range_poll(cls, stream: "_BodyStream", location: str) -> Iterator[bytes]:
         # Long-poll a 202-formed response: open-ended Range GETs from the
         # next unread byte, with Prefer: wait=<seconds> so the server can
         # hold each request until more bytes exist. The GETs use urllib3
@@ -726,13 +749,28 @@ class Unifier:
         # the no-fallback read1 policy. Intermediate 206s carry
         # Content-Range "bytes x-y/*" (total unknown); the response is
         # complete once a numeric total is reported and fully received.
+        # The wait value also budgets the reused connection's age: it is
+        # the backoff value minus how long the connection has been open,
+        # and below cycle_pct of the value the request closes the
+        # connection (Connection: close) so the next opens fresh.
         # Yields the assembled body's bytes; the consuming front joins
         # and interprets them through the same path as a 200 response.
+        pool = stream.pool
         seq = cls._wait_sequence()
         level = cls._wait_level
         offset = 0
         while True:
-            headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={seq[level]}"}
+            # The budget is the current backoff value; the wait sent is
+            # what remains of it on this connection. The connection-age
+            # clock restarts whenever the connection is known dead (our
+            # cycle close, an HTTP error close, or a transport failure).
+            budget = seq[level]
+            remaining = budget - (cls._now() - stream.conn_epoch)
+            wait = max(1, int(remaining))
+            cycle = wait < budget * cls.cycle_pct
+            headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={wait}"}
+            if cycle:
+                headers["Connection"] = "close"
             http_detail = None
             transport_detail = None
             response = None
@@ -748,19 +786,29 @@ class Unifier:
                 )
             except urllib3.exceptions.HTTPError as e:
                 transport_detail = str(e)
+                # The connection is dead; the next request opens a fresh
+                # one, so the age clock restarts.
+                stream.conn_epoch = cls._now()
 
             if response is not None and response.status == 204:
                 # Nothing new yet: ignore and re-request the same range
                 # cursor. The loop builds each Range from `offset`, which
                 # only advances when bytes arrive, so `continue` re-asks
-                # for the same open-ended byte range.
-                response.close()
+                # for the same open-ended byte range. 204 has no body by
+                # definition: drain (no-op read) and return the clean
+                # connection to the pool for the next GET to reuse.
+                response.drain_conn()
+                if cycle:
+                    pool.clear()
+                    stream.conn_epoch = cls._now()
                 continue
 
             if response is not None and response.status != 206:
-                # HTTP-level error: no body is collected from it.
+                # HTTP-level error: no body is collected from it, and the
+                # connection is closed — the clock restarts for the retry.
                 http_detail = f"status code {response.status}"
                 response.close()
+                stream.conn_epoch = cls._now()
             elif response is not None:
                 # 206. Trust the Content-Range the server reports.
                 match = re.fullmatch(
@@ -784,11 +832,15 @@ class Unifier:
                         salvaged += len(piece)
                 except urllib3.exceptions.HTTPError as e:
                     transport_detail = str(e)
+                    stream.conn_epoch = cls._now()  # connection is dead
                 finally:
                     response.close()
                 if transport_detail is None:
                     # The whole declared chunk arrived.
                     offset = end + 1
+                    if cycle:
+                        pool.clear()
+                        stream.conn_epoch = cls._now()
                     if total is not None and offset >= total:
                         break
                     continue
@@ -807,6 +859,7 @@ class Unifier:
                 continue
             cls._wait_level = level
             cls._cleanup_delete(
+                pool,
                 location,
                 f"Unifier query long-poll failed with"
                 f" {transport_detail or http_detail}"
