@@ -155,6 +155,16 @@ class _BodyStream:
             )
             raise _BodyError()
 
+        if self.payload.get("conflation"):
+            # A conflation stream request must be served by the long-poll
+            # path (the response forms at a Location): a direct 200
+            # violates the stream contract — a hard error, not a result.
+            response.close()
+            logger.warning(
+                "Unifier stream conflation answered 200 (expected 202)"
+            )
+            raise _BodyError()
+
         # 200: stream the response body as it arrives. A cut on the direct
         # body has no cursor to advance (that is the long-poll path's
         # salvage), so it fails the query like any other transport error.
@@ -290,6 +300,12 @@ class Unifier:
     # close) and the next one opens fresh at the full value.
     cycle_pct = 0.2
     _now = staticmethod(time.monotonic)
+
+    # Conflation flow control (conflation-2.md): the range-span budget is
+    # bounded by a staleness target (seconds of delivery spread), and the
+    # capacity estimate is an EWMA of bytes-per-target-second samples.
+    STALENESS_TARGET = 1
+    ALPHA = 0.25
 
     __version__ = '0.1.24'
 
@@ -655,8 +671,14 @@ class Unifier:
         column_filters: Optional[str],
         disable_view: bool,
         client_version: Optional[str],
+        conflation: Optional[str] = None,
     ) -> Dict[str, Any]:
         # The query wire payload, shared by query() and stream().
+        # conflation is stream-only (query()'s signature rejects it) and
+        # truthy-gated: on, the value rides the payload verbatim (the kind
+        # of conflation is a server-side detail; the client does not
+        # interpret it), and the POST must be answered 202. Off (None or
+        # any falsy value), the field is absent.
         payload: Dict[str, Any] = {
             "name": name,
             "user": cls.user,
@@ -694,6 +716,8 @@ class Unifier:
             payload["up_to"] = up_to
         if asof_date is not None:
             payload["asof_date"] = asof_date
+        if conflation:
+            payload["conflation"] = conflation
 
         return payload
 
@@ -759,6 +783,15 @@ class Unifier:
         seq = cls._wait_sequence()
         level = cls._wait_level
         offset = 0
+        # Conflation flow control (conflation-2.md): when the payload
+        # carries a truthy conflation value, ranges are bounded with a
+        # per-query span budget — seeded at 1 byte, so the first response
+        # is exactly one whole message — growing under delivery pressure,
+        # shrinking on staleness violations, with an EWMA capacity
+        # estimate. Off: the open-ended range, unchanged.
+        conflation = bool(stream.payload.get("conflation"))
+        span = 1 if conflation else None
+        capacity = None
         while True:
             # The budget is the current backoff value; the wait sent is
             # what remains of it on this connection. The connection-age
@@ -768,13 +801,19 @@ class Unifier:
             remaining = budget - (cls._now() - stream.conn_epoch)
             wait = max(1, int(remaining))
             cycle = wait < budget * cls.cycle_pct
-            headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={wait}"}
+            if conflation:
+                headers = {
+                    "Range": f"bytes={offset}-{offset + span - 1}",
+                    "Prefer": f"wait={wait}",
+                }
+            else:
+                headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={wait}"}
             if cycle:
                 headers["Connection"] = "close"
             http_detail = None
             transport_detail = None
             response = None
-            salvaged = 0
+            received = 0
             total = None
             try:
                 response = pool.request(
@@ -823,18 +862,51 @@ class Unifier:
                 # transport cut mid-body keeps everything that arrived —
                 # read1 has already returned it by the time it raises.
                 # (urllib3 without read1 is a hard error: no fallback.)
+                # In conflation mode, the first and last data-read times
+                # are the delivery spread's bounds; the hold before the
+                # first byte never counts.
+                first_byte = None
+                last_byte = None
                 try:
                     while True:
                         piece = response.read1(65536)
                         if not piece:
                             break
+                        if conflation:
+                            now = cls._now()
+                            if first_byte is None:
+                                first_byte = now
+                            last_byte = now
                         yield piece
-                        salvaged += len(piece)
+                        received += len(piece)
                 except urllib3.exceptions.HTTPError as e:
                     transport_detail = str(e)
                     stream.conn_epoch = cls._now()  # connection is dead
                 finally:
                     response.close()
+                if conflation and received:
+                    # Flow-control update per conflation-2.md: exactly once
+                    # per 206 that delivered bytes — complete or cut —
+                    # before the next request's range is formed. A cut that
+                    # delivered no bytes never reaches here (received == 0):
+                    # no sample, no update.
+                    spread = last_byte - first_byte
+                    measured = spread >= cls.STALENESS_TARGET / 2
+                    if measured:
+                        sample = received * cls.STALENESS_TARGET / spread
+                        if capacity is None:
+                            capacity = sample
+                        else:
+                            capacity += cls.ALPHA * (sample - capacity)
+                    if spread > cls.STALENESS_TARGET:
+                        # Staleness violation: halve, but never below the
+                        # measured capacity (a no-op when capacity already
+                        # covers the span).
+                        span = min(span, max(capacity, span / 2))
+                    elif 2 * received > span:
+                        limit = capacity if measured else float("inf")
+                        span = max(span, min(limit, 2 * received))
+                    span = max(int(span), 1)
                 if transport_detail is None:
                     # The whole declared chunk arrived.
                     offset = end + 1
@@ -847,7 +919,7 @@ class Unifier:
                 # Transport cut mid-body: the bytes read are data; advance
                 # the cursor past them for the retry. If they already reach
                 # the reported total, the cut lost nothing: complete.
-                offset += salvaged
+                offset += received
                 if total is not None and offset >= total:
                     break
 
@@ -984,6 +1056,7 @@ class Unifier:
         column_filters: Optional[str] = None,
         disable_view: bool = False,
         client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+        conflation: Optional[str] = None,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Stream the query result row by row as it arrives.
 
@@ -1000,6 +1073,17 @@ class Unifier:
         flat record is wanted. There is no yield before the first complete
         row.
 
+        Parameters
+        ----------
+        conflation : Optional[str]
+            Stream-only (query() does not accept it). Truthy means on:
+            the value rides the request payload verbatim and the client
+            does not interpret it — which kind of conflation (drop,
+            backfill) is a server-side detail. Off (None or falsy), the
+            field is absent. When on, the POST must be answered 202 — the
+            conflated response forms at a Location like any long-polled
+            response. A direct 200 to a conflation request is an error.
+
         Yields
         ------
         list[dict]
@@ -1013,7 +1097,8 @@ class Unifier:
             nothing for other roots).
         _BodyError
             The body transport failed (already logged; the long-poll path
-            also sent its cleanup DELETE).
+            also sent its cleanup DELETE), or a conflation request was
+            answered 200 instead of 202.
         IncompleteJSONError
             The delivered bytes ended before the JSON document did.
 
@@ -1023,7 +1108,7 @@ class Unifier:
         payload = cls._query_payload(
             name, user, token, key, keys, as_of, back_to, up_to,
             asof_date, asof_back_to, limit, column_filters, disable_view,
-            client_version,
+            client_version, conflation,
         )
         body = cls._body_stream(payload)
         pieces = iter(body)
