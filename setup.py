@@ -2,10 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name='unifier',
-    version='0.1.23',
+    version='0.1.24',
     packages=find_packages(),
     install_requires=[
         'requests',
+        'urllib3',
+        'ijson',
         'pandas',
         'boto3',
     ],

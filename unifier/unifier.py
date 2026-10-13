@@ -1,9 +1,16 @@
 import datetime
+import itertools
+import json
 import logging
 import os
+import re
 import subprocess
 import shutil
-from typing import Any, Dict, List, Optional, Sequence
+import time
+import urllib3.exceptions
+from ijson.backends import yajl2_c
+from typing import Any, Dict, Iterator, List, Optional, Sequence
+from urllib.parse import urljoin
 import fnmatch
 from concurrent.futures import ThreadPoolExecutor
 
@@ -18,6 +25,202 @@ except ImportError:
     TransferConfig = None
 
 logger = logging.getLogger(__name__)
+
+# Sentinel default for client_version: send this client's actual version.
+# A caller-supplied string is sent as-is; explicit None opts out entirely
+# (no client_version field is sent).
+_AUTO_CLIENT_VERSION = object()
+
+
+class _BodyError(Exception):
+    # Internal: the query body transport failed. The failure has already
+    # been logged at its source (the long-poll path has also sent its
+    # cleanup DELETE); this carries the failure to the consuming front,
+    # which decides what returning it looks like.
+    pass
+
+
+class _BodyStream:
+    # Iterable of raw query-response body bytes, yielding them as they
+    # arrive (urllib3 read1; a hard error if read1 is unavailable, no
+    # fallback). The 200/202 decision happens inside the transport, based
+    # on what the server answers: a direct 200 streams its own body; a 202
+    # streams the long-polled Location resource with the backoff/salvage
+    # machinery. `location` records where the body came from (None for a
+    # direct 200) so a front can clean up after interpretation failures
+    # without knowing which path the transport took. A future front can
+    # consume these bytes with a different interpretation than query().
+    # A consumer that abandons a long-polled stream mid-way sends the
+    # cleanup DELETE to its location (GeneratorExit), just like a real
+    # transport failure does.
+
+    def __init__(self, client, payload):
+        self.client = client
+        self.payload = payload
+        self.location = None
+        self.pool = None
+        self.conn_epoch = None
+
+    def abandon(self):
+        # A front ended this body without completing it (abandonment,
+        # interpretation failure, or a spec violation): clean up the
+        # long-polled location explicitly — nested-generator cleanup via
+        # GC is unreliable (ijson's Cython objects are cycle-collected) —
+        # and clear it so the delayed inner cleanup cannot delete twice.
+        # Not for transport real errors: the transport already sent its
+        # cleanup DELETE before raising.
+        if self.location is not None:
+            self.client._cleanup_delete(
+                self.pool,
+                self.location,
+                "Unifier query long-poll abandoned before completion",
+            )
+            self.location = None
+
+    def __iter__(self):
+        # One pool for the whole query lifecycle: the POST, the long-poll
+        # GETs, and any cleanup DELETE all ride the same connection where
+        # possible.
+        pool = urllib3.PoolManager()
+        self.pool = pool
+        # The POST opens the connection; its age budget starts here.
+        self.conn_epoch = self.client._now()
+        headers = {"Content-Type": "application/json"}
+        try:
+            response = pool.request(
+                "POST",
+                self.client.url,
+                body=json.dumps(self.payload).encode(),
+                headers=headers,
+                retries=0,
+                preload_content=False,
+            )
+        except urllib3.exceptions.HTTPError as e:
+            logger.error("Unifier query request failed: %s", e)
+            raise _BodyError() from e
+
+        if response.status == 202:
+            # Accepted: the response is forming at the Location resource
+            # (a generic id, not a file). Location is a relative reference:
+            # resolve it against the request URL that produced the 202,
+            # never against a configured base url. retries=0 means no
+            # redirect following, so the POST URL is exactly that request
+            # URL (urllib3's response.url is not the full URL here).
+            location = response.headers.get("Location")
+            # 202 carries an empty body: drain it and return the clean
+            # connection to the pool for the long-poll GETs to reuse.
+            response.drain_conn()
+            if not location:
+                logger.warning(
+                    "Unifier query 202 response missing Location header"
+                )
+                raise _BodyError()
+            self.location = urljoin(self.client.url, location)
+            try:
+                yield from self.client._range_poll(self, self.location)
+            except GeneratorExit:
+                # The consumer abandoned the stream mid-long-poll: the
+                # location is an incomplete resource, so clean it up like
+                # any other incomplete query. (GeneratorExit must be
+                # re-raised after cleanup.) Skipped when a front has
+                # already abandoned explicitly (location cleared).
+                if self.location is not None:
+                    self.client._cleanup_delete(
+                        pool,
+                        self.location,
+                        "Unifier query long-poll abandoned before completion",
+                    )
+                raise
+            return
+
+        if response.status != 200:
+            # A transport cut of the error body is transport interference,
+            # not a server bug (which would fail loudly): treat it like an
+            # unparseable error body and fall to the status-code log.
+            try:
+                body = response.read()
+            except urllib3.exceptions.HTTPError:
+                body = b""
+            response.close()
+            try:
+                err = json.loads(body)
+            except ValueError:
+                err = {}
+            if isinstance(err, dict) and "error" in err:
+                logger.warning("Unifier query error: %s", err["error"])
+                raise _BodyError()
+
+            logger.warning(
+                "Unifier query failed with status code %s", response.status
+            )
+            raise _BodyError()
+
+        if self.payload.get("conflation"):
+            # A conflation stream request must be served by the long-poll
+            # path (the response forms at a Location): a direct 200
+            # violates the stream contract — a hard error, not a result.
+            response.close()
+            logger.warning(
+                "Unifier stream conflation answered 200 (expected 202)"
+            )
+            raise _BodyError()
+
+        # 200: stream the response body as it arrives. A cut on the direct
+        # body has no cursor to advance (that is the long-poll path's
+        # salvage), so it fails the query like any other transport error.
+        try:
+            while True:
+                piece = response.read1(65536)
+                if not piece:
+                    break
+                yield piece
+        except urllib3.exceptions.HTTPError as e:
+            logger.error("Unifier query request failed: %s", e)
+            raise _BodyError() from e
+        finally:
+            response.close()
+
+
+class _BodyFile:
+    # File-like adapter over a byte-piece iterable (a _BodyStream) for the
+    # ijson parsers, which pull via read(amt). Each read serves from the
+    # buffer and, when the buffer is empty, pulls at most one new piece
+    # (short reads are legal and ijson tolerates them, so pieces are never
+    # aggregated and pacing stays the transport's). `pulled` (opt-in via
+    # snapshot=True) records every byte taken from the piece source, so a
+    # new adapter can replay what an abandoned probe pass (the stream root
+    # check) consumed; accumulating it over a whole body would copy O(n^2)
+    # bytes, so the items pass never snapshots.
+
+    def __init__(self, pieces, snapshot=False):
+        self._pieces = iter(pieces)
+        self._buf = b""
+        self._eof = False
+        self.snapshot = snapshot
+        self.pulled = b""
+
+    def read(self, amt=-1):
+        if not self._buf and not self._eof:
+            try:
+                piece = next(self._pieces)
+            except StopIteration:
+                self._eof = True
+            else:
+                self._buf = piece
+                if self.snapshot:
+                    self.pulled += piece
+        if amt == -1:
+            data, self._buf = self._buf, b""
+        else:
+            data = self._buf[:amt]
+            self._buf = self._buf[amt:]
+        return data
+
+    def detach(self):
+        # Drop the piece-source reference: an abandoned probe pass (its
+        # ijson object has no close and may be cycle-collected) must not
+        # pin the byte generator and delay the abandonment cleanup DELETE.
+        self._pieces = iter(())
 
 
 def _normalize_date(value: Any, field: str) -> Optional[str]:
@@ -79,7 +282,32 @@ class Unifier:
     user = ''
     token = ''
 
-    __version__ = '0.1.23'
+    # Long-poll Prefer: wait backoff (seconds), longest first. An error on
+    # the post-202 GET path steps down one level; the level is sticky for
+    # the process (not persisted) and climbs back one level every `rampup`
+    # error-free queries. `wait`, when set, caps the sequence: it becomes
+    # the longest value and only lower stock values apply.
+    BACKOFF_WAITS = (86400, 3600, 900, 300, 30, 15, 5, 1)
+    wait = None
+    rampup = 10
+    _wait_level = 0
+    _clean_queries = 0
+
+    # Prefer: wait budgets the CONNECTION too, not just the request: the
+    # wait sent is the current backoff value minus the time the reused
+    # connection has been open; when what is left drops below cycle_pct of
+    # the value, the connection is closed after that request (Connection:
+    # close) and the next one opens fresh at the full value.
+    cycle_pct = 0.2
+    _now = staticmethod(time.monotonic)
+
+    # Conflation flow control (conflation-2.md): the range-span budget is
+    # bounded by a staleness target (seconds of delivery spread), and the
+    # capacity estimate is an EWMA of bytes-per-target-second samples.
+    STALENESS_TARGET = 1
+    ALPHA = 0.25
+
+    __version__ = '0.1.24'
 
     @classmethod
     def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
@@ -357,6 +585,7 @@ class Unifier:
         limit: Optional[int] = None,
         column_filters: Optional[str] = None,
         disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
     ) -> List[Sequence[Dict[str, Any]]]:
         """Query the Unifier API and return the raw response data as-is.
 
@@ -380,6 +609,10 @@ class Unifier:
             SQL-compatible boolean expression to filter columns/rows server-side.
         disable_view : bool
             If true, disable view expansion on the server.
+        client_version : Optional[str]
+            Client version string sent with the request. Defaults to this
+            client's actual version; a caller-supplied string is sent
+            as-is; explicit None sends no client_version field.
 
         Returns
         -------
@@ -388,13 +621,75 @@ class Unifier:
             dicts). Returns an empty list on error.
         """
 
-        headers = {"Content-Type": "application/json"}
+        payload = cls._query_payload(
+            name, user, token, key, keys, as_of, back_to, up_to,
+            asof_date, asof_back_to, limit, column_filters, disable_view,
+            client_version,
+        )
+
+        stream = cls._body_stream(payload)
+        try:
+            body = b"".join(stream)
+        except _BodyError:
+            # The transport already logged the failure (and sent its
+            # cleanup DELETE for the long-poll path).
+            return []
+        try:
+            response_data = json.loads(body)
+        except ValueError as e:
+            # Delivered bytes are not JSON: same outcome and log as ever,
+            # plus post-202 cleanup when the body came from a Location.
+            message = f"Unifier query request failed: {e}"
+            if stream.location is not None:
+                cls._cleanup_delete(stream.pool, stream.location, message)
+            else:
+                logger.error(message)
+            return []
+        if not isinstance(response_data, list):
+            message = f"Unexpected query response format: {type(response_data)!r}"
+            if stream.location is not None:
+                cls._cleanup_delete(stream.pool, stream.location, message)
+            else:
+                logger.warning(message)
+            return []
+        return response_data
+
+    @classmethod
+    def _query_payload(
+        cls,
+        name: str,
+        user: Optional[str],
+        token: Optional[str],
+        key: Optional[str],
+        keys: Optional[Sequence[str]],
+        as_of: Optional[str],
+        back_to: Optional[str],
+        up_to: Optional[str],
+        asof_date: Optional[str],
+        asof_back_to: Optional[str],
+        limit: Optional[int],
+        column_filters: Optional[str],
+        disable_view: bool,
+        client_version: Optional[str],
+        conflation: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        # The query wire payload, shared by query() and stream().
+        # conflation is stream-only (query()'s signature rejects it) and
+        # truthy-gated: on, the value rides the payload verbatim (the kind
+        # of conflation is a server-side detail; the client does not
+        # interpret it), and the POST must be answered 202. Off (None or
+        # any falsy value), the field is absent.
         payload: Dict[str, Any] = {
             "name": name,
             "user": cls.user,
             "token": cls.token,
             "disable_view": disable_view,
         }
+
+        if client_version is not None:
+            if client_version is _AUTO_CLIENT_VERSION:
+                client_version = cls.__version__
+            payload["client_version"] = client_version
 
         if limit is not None:
             payload["limit"] = limit
@@ -421,30 +716,236 @@ class Unifier:
             payload["up_to"] = up_to
         if asof_date is not None:
             payload["asof_date"] = asof_date
+        if conflation:
+            payload["conflation"] = conflation
 
+        return payload
+
+    @classmethod
+    def _body_stream(cls, payload: Dict[str, Any]) -> _BodyStream:
+        # The body-byte transport for query() and stream(): one stream that
+        # owns the 200/202 dispatch (see _BodyStream).
+        return _BodyStream(cls, payload)
+
+    @classmethod
+    def _wait_sequence(cls) -> Sequence[int]:
+        if cls.wait is None:
+            return cls.BACKOFF_WAITS
+        return (cls.wait,) + tuple(v for v in cls.BACKOFF_WAITS if v < cls.wait)
+
+    @classmethod
+    def _cleanup_delete(cls, pool, location: str, message: str) -> None:
+        # Real error post-202: best-effort DELETE cleanup on the query's
+        # own connection pool (the long-poll connection is reused when
+        # possible). We do not care whether it succeeds; a failed DELETE
+        # is appended info on the error we already have, never a new
+        # error. The server's own cleanup does not strictly depend on this
+        # DELETE arriving.
+        cleanup = ""
         try:
-            response = requests.post(cls.url, headers=headers, json=payload)
-            if response.status_code != 200:
-                try:
-                    err = response.json()
-                except ValueError:
-                    err = {}
-                if isinstance(err, dict) and "error" in err:
-                    logger.warning("Unifier query error: %s", err["error"])
-                    return []
-
-                logger.warning(
-                    "Unifier query failed with status code %s", response.status_code
+            response = pool.request("DELETE", location, retries=0)
+            if not 200 <= response.status < 300:
+                cleanup = (
+                    f"; cleanup DELETE failed with status code {response.status}"
                 )
-                return []
-            response_data = response.json()
-            if not isinstance(response_data, list):
-                logger.warning("Unexpected query response format: %r", type(response_data))
-                return []
-            return response_data
-        except requests.exceptions.RequestException as e:
-            logger.error("Unifier query request failed: %s", e)
-            return []
+        except urllib3.exceptions.HTTPError as e:
+            cleanup = f"; cleanup DELETE failed: {e}"
+        logger.warning("%s%s", message, cleanup)
+
+    @classmethod
+    def _range_poll(cls, stream: "_BodyStream", location: str) -> Iterator[bytes]:
+        # Long-poll a 202-formed response: open-ended Range GETs from the
+        # next unread byte, with Prefer: wait=<seconds> so the server can
+        # hold each request until more bytes exist. The GETs use urllib3
+        # directly (no retries: this loop owns retrying) and yield the 206
+        # body as it streams: a transport failure (not an HTTP error) that
+        # cuts the stream mid-body keeps the bytes already read as data,
+        # and the retry advances the range cursor past them instead of
+        # re-requesting the same range — a response that was progressing
+        # toward 206 but cut by a proxy or MITM still contributes. 204
+        # means nothing new yet (re-request the same cursor). Any other
+        # GET error steps down the sticky backoff sequence one level; an
+        # error while already at the shortest wait is a real error and
+        # sends a best-effort DELETE to the location before raising. The
+        # server conforms to the protocol spec, so Content-Range is
+        # trusted and never validated: a non-conforming value is a hard
+        # error (the parse fails loudly), not handled — consistent with
+        # the no-fallback read1 policy. Intermediate 206s carry
+        # Content-Range "bytes x-y/*" (total unknown); the response is
+        # complete once a numeric total is reported and fully received.
+        # The wait value also budgets the reused connection's age: it is
+        # the backoff value minus how long the connection has been open,
+        # and below cycle_pct of the value the request closes the
+        # connection (Connection: close) so the next opens fresh.
+        # Yields the assembled body's bytes; the consuming front joins
+        # and interprets them through the same path as a 200 response.
+        pool = stream.pool
+        seq = cls._wait_sequence()
+        level = cls._wait_level
+        offset = 0
+        # Conflation flow control (conflation-2.md): when the payload
+        # carries a truthy conflation value, ranges are bounded with a
+        # per-query span budget — seeded at 1 byte, so the first response
+        # is exactly one whole message — growing under delivery pressure,
+        # shrinking on staleness violations, with an EWMA capacity
+        # estimate. Off: the open-ended range, unchanged.
+        conflation = bool(stream.payload.get("conflation"))
+        span = 1 if conflation else None
+        capacity = None
+        while True:
+            # The budget is the current backoff value; the wait sent is
+            # what remains of it on this connection. The connection-age
+            # clock restarts whenever the connection is known dead (our
+            # cycle close, an HTTP error close, or a transport failure).
+            budget = seq[level]
+            remaining = budget - (cls._now() - stream.conn_epoch)
+            wait = max(1, int(remaining))
+            cycle = wait < budget * cls.cycle_pct
+            if conflation:
+                headers = {
+                    "Range": f"bytes={offset}-{offset + span - 1}",
+                    "Prefer": f"wait={wait}",
+                }
+            else:
+                headers = {"Range": f"bytes={offset}-", "Prefer": f"wait={wait}"}
+            if cycle:
+                headers["Connection"] = "close"
+            http_detail = None
+            transport_detail = None
+            response = None
+            received = 0
+            total = None
+            try:
+                response = pool.request(
+                    "GET",
+                    location,
+                    headers=headers,
+                    retries=0,
+                    preload_content=False,
+                )
+            except urllib3.exceptions.HTTPError as e:
+                transport_detail = str(e)
+                # The connection is dead; the next request opens a fresh
+                # one, so the age clock restarts.
+                stream.conn_epoch = cls._now()
+
+            if response is not None and response.status == 204:
+                # Nothing new yet: ignore and re-request the same range
+                # cursor. The loop builds each Range from `offset`, which
+                # only advances when bytes arrive, so `continue` re-asks
+                # for the same open-ended byte range. 204 has no body by
+                # definition: drain (no-op read) and return the clean
+                # connection to the pool for the next GET to reuse.
+                response.drain_conn()
+                if cycle:
+                    pool.clear()
+                    stream.conn_epoch = cls._now()
+                continue
+
+            if response is not None and response.status != 206:
+                # HTTP-level error: no body is collected from it, and the
+                # connection is closed — the clock restarts for the retry.
+                http_detail = f"status code {response.status}"
+                response.close()
+                stream.conn_epoch = cls._now()
+            elif response is not None:
+                # 206. Trust the Content-Range the server reports.
+                match = re.fullmatch(
+                    r"bytes (\d+)-(\d+)/(\d+|\*)",
+                    response.headers.get("Content-Range", "").strip(),
+                )
+                end = int(match.group(2))
+                complete = match.group(3)
+                total = int(complete) if complete != "*" else None
+                # Stream the body: read1 returns bytes as they arrive
+                # instead of blocking for the full declared length, so a
+                # transport cut mid-body keeps everything that arrived —
+                # read1 has already returned it by the time it raises.
+                # (urllib3 without read1 is a hard error: no fallback.)
+                # In conflation mode, the first and last data-read times
+                # are the delivery spread's bounds; the hold before the
+                # first byte never counts.
+                first_byte = None
+                last_byte = None
+                try:
+                    while True:
+                        piece = response.read1(65536)
+                        if not piece:
+                            break
+                        if conflation:
+                            now = cls._now()
+                            if first_byte is None:
+                                first_byte = now
+                            last_byte = now
+                        yield piece
+                        received += len(piece)
+                except urllib3.exceptions.HTTPError as e:
+                    transport_detail = str(e)
+                    stream.conn_epoch = cls._now()  # connection is dead
+                finally:
+                    response.close()
+                if conflation and received:
+                    # Flow-control update per conflation-2.md: exactly once
+                    # per 206 that delivered bytes — complete or cut —
+                    # before the next request's range is formed. A cut that
+                    # delivered no bytes never reaches here (received == 0):
+                    # no sample, no update.
+                    spread = last_byte - first_byte
+                    measured = spread >= cls.STALENESS_TARGET / 2
+                    if measured:
+                        sample = received * cls.STALENESS_TARGET / spread
+                        if capacity is None:
+                            capacity = sample
+                        else:
+                            capacity += cls.ALPHA * (sample - capacity)
+                    if spread > cls.STALENESS_TARGET:
+                        # Staleness violation: halve, but never below the
+                        # measured capacity (a no-op when capacity already
+                        # covers the span).
+                        span = min(span, max(capacity, span / 2))
+                    elif 2 * received > span:
+                        limit = capacity if measured else float("inf")
+                        span = max(span, min(limit, 2 * received))
+                    span = max(int(span), 1)
+                if transport_detail is None:
+                    # The whole declared chunk arrived.
+                    offset = end + 1
+                    if cycle:
+                        pool.clear()
+                        stream.conn_epoch = cls._now()
+                    if total is not None and offset >= total:
+                        break
+                    continue
+                # Transport cut mid-body: the bytes read are data; advance
+                # the cursor past them for the retry. If they already reach
+                # the reported total, the cut lost nothing: complete.
+                offset += received
+                if total is not None and offset >= total:
+                    break
+
+            # An error (HTTP-level or transport): back off one wait level
+            # and retry, or fail for real at the minimum wait.
+            if level + 1 < len(seq):
+                level += 1
+                cls._clean_queries = 0
+                continue
+            cls._wait_level = level
+            cls._cleanup_delete(
+                pool,
+                location,
+                f"Unifier query long-poll failed with"
+                f" {transport_detail or http_detail}"
+                f" at minimum wait {seq[level]}",
+            )
+            raise _BodyError()
+        # Success: the level is sticky; every `rampup` error-free queries
+        # at a backed-off level climbs one level back up.
+        cls._wait_level = level
+        if level > 0:
+            cls._clean_queries += 1
+            if cls._clean_queries >= cls.rampup:
+                cls._wait_level = level - 1
+                cls._clean_queries = 0
 
     @classmethod
     def get_dataframe(
@@ -462,6 +963,7 @@ class Unifier:
         limit: Optional[int] = None,
         column_filters: Optional[str] = None,
         disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
     ) -> pd.DataFrame:
         """Get the query result as a pandas DataFrame.
 
@@ -482,6 +984,7 @@ class Unifier:
             limit,
             column_filters,
             disable_view,
+            client_version=client_version,
         )
         if not json_result:
             return pd.DataFrame()
@@ -506,6 +1009,7 @@ class Unifier:
         limit: Optional[int] = None,
         column_filters: Optional[str] = None,
         disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
     ) -> List[Dict[str, Any]]:
         """Get the query result as a flattened JSON list of dicts.
 
@@ -526,6 +1030,7 @@ class Unifier:
             limit,
             column_filters,
             disable_view,
+            client_version=client_version,
         )
         if not json_result:
             return []
@@ -533,6 +1038,123 @@ class Unifier:
             {k: v for d in item for k, v in d.items()} for item in json_result
         ]
         return extracted_data
+
+    @classmethod
+    def stream(
+        cls,
+        name: str,
+        user: Optional[str] = None,
+        token: Optional[str] = None,
+        key: Optional[str] = None,
+        keys: Optional[Sequence[str]] = None,
+        as_of: Optional[str] = None,
+        back_to: Optional[str] = None,
+        up_to: Optional[str] = None,
+        asof_date: Optional[str] = None,
+        asof_back_to: Optional[str] = None,
+        limit: Optional[int] = None,
+        column_filters: Optional[str] = None,
+        disable_view: bool = False,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+        conflation: Optional[str] = None,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """Stream the query result row by row as it arrives.
+
+        Same parameters and same transport as query() (including the 202
+        long-poll path and its salvage/backoff machinery), but rows are
+        yielded as soon as each one completes instead of waiting for the
+        whole body: a front can watch the response roll in as the server
+        publishes it. Parsing is incremental (ijson, yajl2_c C backend
+        confirmed at import: no fallback) and numbers are floats, matching
+        json.loads, so rows carry identical value types to query().
+
+        Each yielded row is the row's list of fragment dicts, exactly as
+        query() returns them; merge fragments as get_dataframe does if a
+        flat record is wanted. There is no yield before the first complete
+        row.
+
+        Parameters
+        ----------
+        conflation : Optional[str]
+            Stream-only (query() does not accept it). Truthy means on:
+            the value rides the request payload verbatim and the client
+            does not interpret it — which kind of conflation (drop,
+            backfill) is a server-side detail. Off (None or falsy), the
+            field is absent. When on, the POST must be answered 202 — the
+            conflated response forms at a Location like any long-polled
+            response. A direct 200 to a conflation request is an error.
+
+        Yields
+        ------
+        list[dict]
+            One row (a list of fragment dicts) per yield.
+
+        Raises
+        ------
+        ValueError
+            The response root is not the query list (a conforming server
+            always sends the list; items() alone would silently yield
+            nothing for other roots).
+        _BodyError
+            The body transport failed (already logged; the long-poll path
+            also sent its cleanup DELETE), or a conflation request was
+            answered 200 instead of 202.
+        IncompleteJSONError
+            The delivered bytes ended before the JSON document did.
+
+        Abandoning the generator mid-stream sends the cleanup DELETE to a
+        long-polled location, just like any other incomplete query.
+        """
+        payload = cls._query_payload(
+            name, user, token, key, keys, as_of, back_to, up_to,
+            asof_date, asof_back_to, limit, column_filters, disable_view,
+            client_version, conflation,
+        )
+        body = cls._body_stream(payload)
+        pieces = iter(body)
+        # Cleanup is explicit on every exit path: cleanup via nested
+        # generator GC is unreliable (ijson's Cython objects are
+        # cycle-collected), so stream() owns the DELETE and the transport
+        # generator's unwinding itself.
+        try:
+            # Root contract: items() over a non-array root yields nothing
+            # and no error, so the root is verified from the first parse
+            # event. The probe adapter snapshots what the probe consumed;
+            # the items pass replays the snapshot, then continues the same
+            # byte generator. The probe adapter is detached after: the
+            # probe's ijson object has no close() and may be
+            # cycle-collected, so it must not pin the byte generator.
+            probe = _BodyFile(pieces, snapshot=True)
+            first = next(yajl2_c.parse(probe), None)
+            probe.detach()
+            if first is None or first[0] != "" or first[1] != "start_array":
+                raise ValueError(f"Unexpected stream response root: {first!r}")
+            f = _BodyFile(itertools.chain([probe.pulled], pieces))
+            for row in yajl2_c.items(f, "item", use_float=True):
+                yield row
+            # The document is fully parsed, but the transport generator is
+            # still suspended at its final yield: drain it so its
+            # completion bookkeeping (sticky wait level, rampup) runs.
+            for _ in pieces:
+                pass
+            # Completed: the resource is finished, nothing to clean up.
+            body.location = None
+        except GeneratorExit:
+            body.abandon()
+            raise
+        except _BodyError:
+            raise  # transport real error: already logged and DELETEd
+        except Exception:
+            # Interpretation/spec failure (ValueError root,
+            # IncompleteJSONError truncation): the location is an
+            # incomplete or unusable resource — clean it up.
+            body.abandon()
+            raise
+        finally:
+            # Unwind the transport generator promptly no matter how the
+            # stream ends: it closes its in-flight response; its own
+            # cleanup sees a cleared location, so it cannot delete twice.
+            pieces.close()
 
     @classmethod
     def replicate(
