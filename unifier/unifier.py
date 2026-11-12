@@ -1,13 +1,24 @@
+"""Client helpers to interact with the Unifier API.
+
+The client knows no query parameters: everything beyond the dataset name
+and credentials passes through to the server verbatim, so the parameters
+cannot be documented here. The protocol is the contract, documented by the
+server's OpenAPI document — call `Unifier.help()` to fetch and print it
+over the internet.
+"""
+
 import datetime
 import itertools
 import json
 import logging
 import os
 import re
+import reprlib
 import subprocess
 import shutil
 import time
 import urllib3.exceptions
+import warnings
 from ijson.backends import yajl2_c
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import urljoin
@@ -30,6 +41,68 @@ logger = logging.getLogger(__name__)
 # A caller-supplied string is sent as-is; explicit None opts out entirely
 # (no client_version field is sent).
 _AUTO_CLIENT_VERSION = object()
+
+# Positional arguments are deprecated: every parameter is keyword-only. For
+# compatibility, each method still accepts the positional orders it accepted
+# before 0.1.24 — and only those (frozen here; nothing new is ever added) —
+# and warns with the equivalent named call.
+_LEGACY_QUERY_ORDER = (
+    "name", "user", "token", "key", "keys", "as_of", "back_to", "up_to",
+    "asof_date", "asof_back_to", "limit", "column_filters", "disable_view",
+)
+_LEGACY_REPLICATE_ORDER = (
+    "name", "target_location", "asof_date", "back_to", "up_to",
+    "bandwidth_limit", "use_rclone",
+)
+_SECRET_ARGS = ("user", "token")   # never echoed in a warning
+_DEFAULT_TARGET = "."   # replicate(): download into the current directory
+_warn_repr = reprlib.Repr()
+_warn_repr.maxstring = 80
+_warn_repr.maxother = 80
+
+
+def _legacy_positional(
+    method: str,
+    order: Sequence[str],
+    args: Sequence[Any],
+    named: Dict[str, Any],
+    defaults: Optional[Dict[str, Any]] = None,
+    stacklevel: int = 3,
+) -> Dict[str, Any]:
+    """Bind deprecated positional `args` to their names in `order`.
+
+    Returns `named` updated with the positional values (a None positional
+    means "not given", as it always did). Raises TypeError as Python would
+    for too many positionals or one also given by name. Warns (FutureWarning,
+    shown once per calling line) with the equivalent named call; credentials
+    are masked.
+    """
+    defaults = defaults or {}
+    if len(args) > len(order):
+        raise TypeError(
+            f"{method}() takes at most {len(order)} positional arguments "
+            f"({len(args)} given)"
+        )
+    out = dict(named)
+    for key, value in zip(order, args):
+        if key in named and named[key] is not defaults.get(key):
+            raise TypeError(f"{method}() got multiple values for argument {key!r}")
+        if value is not None:
+            out[key] = value
+    # The whole equivalent call: positional values plus what was named.
+    shown = [
+        f"{key}=..." if key in _SECRET_ARGS else f"{key}={_warn_repr.repr(value)}"
+        for key, value in out.items()
+        if value is not None and value is not defaults.get(key)
+    ]
+    warnings.warn(
+        f"unifier.{method}(): positional arguments are deprecated and support "
+        f"for them will be removed in a future release; use named arguments: "
+        f"{method}({', '.join(shown)})",
+        FutureWarning,
+        stacklevel=stacklevel,
+    )
+    return out
 
 
 class _BodyError(Exception):
@@ -155,7 +228,7 @@ class _BodyStream:
             )
             raise _BodyError()
 
-        if self.payload.get("conflation"):
+        if "conflation" in self.payload:
             # A conflation stream request must be served by the long-poll
             # path (the response forms at a Location): a direct 200
             # violates the stream contract — a hard error, not a result.
@@ -274,8 +347,10 @@ class Unifier:
     -----
     - Credentials can be set via the class variables `user` and `token` or
       passed per-call to the query helpers.
-    - The `as_of` parameter is deprecated; prefer `asof_date` and
-      `asof_back_to`.
+    - The client knows no query parameters: everything beyond the dataset
+      name and credentials passes through to the server verbatim. The
+      protocol is the contract, documented by the server's OpenAPI
+      document — `Unifier.help()` fetches and prints it over the internet.
     """
     
     url = 'https://unifier.x-tech.ai/unifier'
@@ -310,26 +385,32 @@ class Unifier:
     __version__ = '0.1.24'
 
     @classmethod
-    def get_asof_dates_query(cls, name: str) -> List[Dict[str, Any]]:
+    def get_asof_dates_query(cls, *legacy: Any, name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get a list of available as-of dates for a given data `name`.
 
         Parameters
         ----------
         name: str
             The dataset or query name for which to fetch as-of dates.
+            Keyword-only; positional use is deprecated (warns).
 
         Returns
         -------
         list[dict]
             A flattened list of records with available as-of dates. Returns an
             empty list on error.
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            name = _legacy_positional("get_asof_dates_query", ("name",), legacy, {"name": name})["name"]
         headers = {"Content-Type": "application/json"}
         payload = {
-            "name": name,
             "user": cls.user,
             "token": cls.token,
         }
+        if name is not None:
+            payload["name"] = name
 
         _url = cls.url + "/get_asof_date"
         try:
@@ -363,19 +444,34 @@ class Unifier:
             return []
 
     @classmethod
-    def get_asof_dates(cls, name: str) -> pd.DataFrame:
-        """Get a pandas DataFrame of available as-of dates for a given name."""
-        _data = cls.get_asof_dates_query(name)
+    def get_asof_dates(cls, *legacy: Any, name: Optional[str] = None) -> pd.DataFrame:
+        """Get a pandas DataFrame of available as-of dates for a given name.
+
+        `name` is keyword-only; positional use is deprecated (warns).
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
+        """
+        if legacy:
+            name = _legacy_positional("get_asof_dates", ("name",), legacy, {"name": name})["name"]
+        _data = cls.get_asof_dates_query(name=name)
         return pd.DataFrame(_data)
 
     @classmethod
-    def get_asof_dates_json(cls, name: str) -> List[Dict[str, Any]]:
-        """Get a Python list of available as-of dates for a given name."""
-        return cls.get_asof_dates_query(name)
+    def get_asof_dates_json(cls, *legacy: Any, name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get a Python list of available as-of dates for a given name.
+
+        `name` is keyword-only; positional use is deprecated (warns).
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
+        """
+        if legacy:
+            name = _legacy_positional("get_asof_dates_json", ("name",), legacy, {"name": name})["name"]
+        return cls.get_asof_dates_query(name=name)
 
     @classmethod
     def list_data_catalog(
         cls,
+        *legacy: Any,
         show_all_datasets: bool = False,
         product_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -395,7 +491,17 @@ class Unifier:
         -------
         list[dict]
             A list of dataset metadata objects. Returns an empty list on error.
+        Parameters are keyword-only; positional use is deprecated (warns).
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            a = _legacy_positional(
+                "list_data_catalog", ("show_all_datasets", "product_type"), legacy,
+                {"show_all_datasets": show_all_datasets, "product_type": product_type},
+                defaults={"show_all_datasets": False},
+            )
+            show_all_datasets, product_type = a["show_all_datasets"], a["product_type"]
         headers = {"Content-Type": "application/json"}
         payload = {
             "user": cls.user,
@@ -425,6 +531,7 @@ class Unifier:
     @classmethod
     def list_entitled_datasets(
         cls,
+        *legacy: Any,
         date: Optional[Any] = None,
         from_date: Optional[Any] = None,
         to_date: Optional[Any] = None,
@@ -464,7 +571,16 @@ class Unifier:
         Only datasets that are currently live are returned, including for
         historical dates. A dataset retired since then will not appear even if
         the entitlement was active at the time.
+        Parameters are keyword-only; positional use is deprecated (warns).
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            a = _legacy_positional(
+                "list_entitled_datasets", ("date", "from_date", "to_date"), legacy,
+                {"date": date, "from_date": from_date, "to_date": to_date},
+            )
+            date, from_date, to_date = a["date"], a["from_date"], a["to_date"]
         if date is not None and (from_date is not None or to_date is not None):
             raise ValueError(
                 "'date' cannot be combined with 'from_date' or 'to_date'"
@@ -520,7 +636,8 @@ class Unifier:
     @classmethod
     def get_dataset_details(
         cls,
-        name: str,
+        *legacy: Any,
+        name: Optional[str] = None,
         show_all_datasets: bool = False,
         product_type: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -541,13 +658,24 @@ class Unifier:
         -------
         dict
             The dataset metadata object. Returns an empty dict on error.
+        Parameters are keyword-only; positional use is deprecated (warns).
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            a = _legacy_positional(
+                "get_dataset_details", ("name", "show_all_datasets", "product_type"), legacy,
+                {"name": name, "show_all_datasets": show_all_datasets, "product_type": product_type},
+                defaults={"show_all_datasets": False},
+            )
+            name, show_all_datasets, product_type = a["name"], a["show_all_datasets"], a["product_type"]
         headers = {"Content-Type": "application/json"}
         payload = {
-            "name": name,
             "user": cls.user,
             "token": cls.token,
         }
+        if name is not None:
+            payload["name"] = name
         _apply_catalog_scope(payload, show_all_datasets, product_type)
 
         _url = cls.url + "/data-catalog"
@@ -570,49 +698,89 @@ class Unifier:
             return {}
 
     @classmethod
+    def help(cls) -> None:
+        """Print the query protocol's parameters, fetched live from the server.
+
+        The client bakes in no parameter knowledge, so the documentation
+        cannot ship with it either: this fetches the server's OpenAPI
+        (Swagger) document at <url>/swagger/doc.json over the internet and
+        prints the request model of every /unifier path it describes.
+        Raises RuntimeError naming the URL when the document cannot be
+        fetched or parsed.
+        """
+        doc_url = cls.url.rstrip("/") + "/swagger/doc.json"
+        try:
+            response = requests.get(doc_url, timeout=10)
+            response.raise_for_status()
+            doc = response.json()
+        except Exception as e:
+            raise RuntimeError(f"cannot fetch the protocol document from {doc_url}: {e}") from e
+        try:
+            for path, ops in sorted(doc.get("paths", {}).items()):
+                if not path.startswith("/unifier"):
+                    continue
+                for method, op in sorted(ops.items()):
+                    print(f"{method.upper()} {path} — {op.get('summary', '')}")
+                    if op.get("description") and op["description"] != op.get("summary"):
+                        print(f"  {op['description']}")
+                    for p in op.get("parameters", []):
+                        schema = p.get("schema", {})
+                        ref = schema.get("$ref", "")
+                        model = ref.rsplit("/", 1)[-1] if ref else None
+                        props = doc.get("definitions", {}).get(model, {}).get("properties", {}) if model else {}
+                        if props:
+                            print(f"  body ({model}):")
+                            for fname, fdef in sorted(props.items()):
+                                ftype = fdef.get("type", fdef.get("$ref", "?").rsplit("/", 1)[-1])
+                                fdesc = fdef.get("description", "")
+                                print(f"    {fname}: {ftype}" + (f" — {fdesc}" if fdesc else ""))
+                        elif p.get("name"):
+                            print(f"  {p.get('in', '?')} {p['name']}: {p.get('type', '?')}"
+                                  + (f" — {p.get('description', '')}" if p.get("description") else ""))
+        except Exception as e:
+            raise RuntimeError(f"cannot parse the protocol document from {doc_url}: {e}") from e
+
+    @classmethod
     def query(
         cls,
-        name: str,
+        *legacy: Any,
+        name: Optional[str] = None,
         user: Optional[str] = None,
         token: Optional[str] = None,
-        key: Optional[str] = None,
-        keys: Optional[Sequence[str]] = None,
-        as_of: Optional[str] = None,
-        back_to: Optional[str] = None,
-        up_to: Optional[str] = None,
-        asof_date: Optional[str] = None,
-        asof_back_to: Optional[str] = None,
-        limit: Optional[int] = None,
-        column_filters: Optional[str] = None,
-        disable_view: bool = False,
         client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+        params: Optional[Dict[str, Any]] = None,
+        **kw: Any,
     ) -> List[Sequence[Dict[str, Any]]]:
         """Query the Unifier API and return the raw response data as-is.
 
+        The client knows no query parameters: everything beyond `name` and
+        credentials rides verbatim to the server, from `params` and any extra
+        keyword arguments alike. The protocol is the contract, documented by
+        the server's OpenAPI document — `Unifier.help()` fetches and prints
+        it. This helper must not need a release per new server parameter.
+
+        All parameters are keyword-only. Positional arguments are deprecated:
+        the positional orders of earlier releases still work but warn
+        (FutureWarning) with the equivalent named call, and support will be
+        removed in a future release.
+
         Parameters
         ----------
-        name : str
-            The query or dataset name.
+        name : Optional[str]
+            The query or dataset name; sent only when given.
         user, token : Optional[str]
             Override class-level credentials.
-        key : Optional[str]
-            Single key filter.
-        keys : Optional[Sequence[str]]
-            Multiple keys filter.
-        as_of : Optional[str]
-            Deprecated; prefer `asof_date` or `asof_back_to`.
-        back_to, up_to, asof_date, asof_back_to : Optional[str]
-            Temporal filtering parameters.
-        limit : Optional[int]
-            Max number of rows/records.
-        column_filters : Optional[str]
-            SQL-compatible boolean expression to filter columns/rows server-side.
-        disable_view : bool
-            If true, disable view expansion on the server.
         client_version : Optional[str]
             Client version string sent with the request. Defaults to this
             client's actual version; a caller-supplied string is sent
             as-is; explicit None sends no client_version field.
+        params : Optional[Dict[str, Any]]
+            Protocol parameters, merged into the request payload verbatim.
+            Extra keyword arguments do the same (kw wins on collision).
+            By default query() sends no `conflation` field. Passing one
+            (any value, None included) makes the request a stream, served
+            like stream()'s; query() returns once the server ends it, so
+            only use it for streaming queries that end.
 
         Returns
         -------
@@ -620,12 +788,10 @@ class Unifier:
             The JSON payload returned by the API (commonly a list of lists of
             dicts). Returns an empty list on error.
         """
+        if legacy:
+            name, user, token, kw = cls._legacy_query_args("query", legacy, name, user, token, kw)
 
-        payload = cls._query_payload(
-            name, user, token, key, keys, as_of, back_to, up_to,
-            asof_date, asof_back_to, limit, column_filters, disable_view,
-            client_version,
-        )
+        payload = cls._payload(name, user, token, client_version, params, kw)
 
         stream = cls._body_stream(payload)
         try:
@@ -654,71 +820,73 @@ class Unifier:
             return []
         return response_data
 
+    @staticmethod
+    def _legacy_query_args(method, legacy, name, user, token, kw):
+        # Deprecated positional call in the pre-0.1.24 order of query(),
+        # get_dataframe() and get_json(): bind it to names (and warn, at the
+        # caller's line: user -> method -> here -> _legacy_positional).
+        # A positional as_of (position 6) meant asof_date, unless asof_date
+        # (position 9) was also given: rebind it so the suggested named call
+        # uses the current name.
+        legacy = list(legacy)
+        if len(legacy) > 5 and legacy[5] is not None:
+            if len(legacy) <= 8 or legacy[8] is None:
+                legacy += [None] * (9 - len(legacy))
+                legacy[8] = legacy[5]
+            legacy[5] = None
+        a = _legacy_positional(
+            method, _LEGACY_QUERY_ORDER, legacy,
+            {"name": name, "user": user, "token": token, **kw}, stacklevel=4,
+        )
+        name, user, token = a.pop("name"), a.pop("user"), a.pop("token")
+        return name, user, token, a
+
     @classmethod
-    def _query_payload(
+    def _payload(
         cls,
-        name: str,
+        name: Optional[str],
         user: Optional[str],
         token: Optional[str],
-        key: Optional[str],
-        keys: Optional[Sequence[str]],
-        as_of: Optional[str],
-        back_to: Optional[str],
-        up_to: Optional[str],
-        asof_date: Optional[str],
-        asof_back_to: Optional[str],
-        limit: Optional[int],
-        column_filters: Optional[str],
-        disable_view: bool,
         client_version: Optional[str],
-        conflation: Optional[str] = None,
+        params: Optional[Dict[str, Any]],
+        kw: Dict[str, Any],
     ) -> Dict[str, Any]:
-        # The query wire payload, shared by query() and stream().
-        # conflation is stream-only (query()'s signature rejects it) and
-        # truthy-gated: on, the value rides the payload verbatim (the kind
-        # of conflation is a server-side detail; the client does not
-        # interpret it), and the POST must be answered 202. Off (None or
-        # any falsy value), the field is absent.
-        payload: Dict[str, Any] = {
-            "name": name,
-            "user": cls.user,
-            "token": cls.token,
-            "disable_view": disable_view,
-        }
-
+        # The wire payload, shared by query(), stream() and replicate().
+        # The client knows no query parameters: everything beyond name and
+        # credentials rides verbatim from `params` and keyword arguments (kw
+        # wins over params on collision). The protocol is the contract,
+        # documented by the server (help() fetches its OpenAPI document);
+        # this client is a convenience helper and must not need a release
+        # per new server parameter. Helper-owned fields (name, credentials,
+        # client_version) always win: they are set from the helper's own
+        # arguments after the merge (name only when given: a future request
+        # may name its datasets otherwise).
+        payload: Dict[str, Any] = dict(params or {})
+        payload.update(kw)
+        # Compatibility with releases before 0.1.24, which knew these two
+        # parameters: `as_of` was always sent as `asof_date` (an explicit
+        # asof_date wins), and `keys` was sent as a list.
+        if "as_of" in payload:
+            warnings.warn(
+                "unifier: 'as_of' is deprecated; use 'asof_date'",
+                FutureWarning, stacklevel=3,
+            )
+            as_of = payload.pop("as_of")
+            if as_of is not None and payload.get("asof_date") is None:
+                payload["asof_date"] = as_of
+        keys = payload.get("keys")
+        if keys is not None and not isinstance(keys, (list, str, bytes, dict)):
+            payload["keys"] = list(keys)
+        if name is not None:
+            payload["name"] = name
+        payload["user"] = user if user is not None else cls.user
+        payload["token"] = token if token is not None else cls.token
         if client_version is not None:
             if client_version is _AUTO_CLIENT_VERSION:
                 client_version = cls.__version__
             payload["client_version"] = client_version
-
-        if limit is not None:
-            payload["limit"] = limit
-
-        if key is not None:
-            payload["key"] = key
-        if keys is not None:
-            payload["keys"] = list(keys)
-        if token is not None:
-            payload["token"] = token
-        if user is not None:
-            payload["user"] = user
-        if column_filters is not None:
-            payload["column_filters"] = column_filters
-
-        # `as_of` is deprecated; map to `asof_date` for backward compatibility.
-        if as_of is not None:
-            payload["asof_date"] = as_of
-        if asof_back_to is not None:
-            payload["asof_back_to"] = asof_back_to
-        if back_to is not None:
-            payload["back_to"] = back_to
-        if up_to is not None:
-            payload["up_to"] = up_to
-        if asof_date is not None:
-            payload["asof_date"] = asof_date
-        if conflation:
-            payload["conflation"] = conflation
-
+        else:
+            payload.pop("client_version", None)
         return payload
 
     @classmethod
@@ -783,13 +951,13 @@ class Unifier:
         seq = cls._wait_sequence()
         level = cls._wait_level
         offset = 0
-        # Conflation flow control: when the payload
-        # carries a truthy conflation value, ranges are bounded with a
+        # Conflation flow control: when the payload carries a
+        # conflation field (any value, null included), ranges are bounded with a
         # per-query span budget — seeded at 1 byte, so the first response
         # is exactly one whole message — growing under delivery pressure,
         # shrinking on staleness violations, with an EWMA capacity
         # estimate. Off: the open-ended range, unchanged.
-        conflation = bool(stream.payload.get("conflation"))
+        conflation = "conflation" in stream.payload
         span = 1 if conflation else None
         capacity = None
         while True:
@@ -950,41 +1118,32 @@ class Unifier:
     @classmethod
     def get_dataframe(
         cls,
-        name: str,
+        *legacy: Any,
+        name: Optional[str] = None,
         user: Optional[str] = None,
         token: Optional[str] = None,
-        key: Optional[str] = None,
-        keys: Optional[Sequence[str]] = None,
-        as_of: Optional[str] = None,
-        back_to: Optional[str] = None,
-        up_to: Optional[str] = None,
-        asof_date: Optional[str] = None,
-        asof_back_to: Optional[str] = None,
-        limit: Optional[int] = None,
-        column_filters: Optional[str] = None,
-        disable_view: bool = False,
         client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+        params: Optional[Dict[str, Any]] = None,
+        **kw: Any,
     ) -> pd.DataFrame:
         """Get the query result as a pandas DataFrame.
 
+        Takes query()'s parameters (all protocol parameters pass through
+        verbatim; all keyword-only, positional use deprecated; see query()).
         Returns an empty DataFrame on error or empty result.
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            name, user, token, kw = cls._legacy_query_args("get_dataframe", legacy, name, user, token, kw)
 
         json_result = cls.query(
-            name,
-            user,
-            token,
-            key,
-            keys,
-            as_of,
-            back_to,
-            up_to,
-            asof_date,
-            asof_back_to,
-            limit,
-            column_filters,
-            disable_view,
+            name=name,
+            user=user,
+            token=token,
             client_version=client_version,
+            params=params,
+            **kw,
         )
         if not json_result:
             return pd.DataFrame()
@@ -996,41 +1155,32 @@ class Unifier:
     @classmethod
     def get_json(
         cls,
-        name: str,
+        *legacy: Any,
+        name: Optional[str] = None,
         user: Optional[str] = None,
         token: Optional[str] = None,
-        key: Optional[str] = None,
-        keys: Optional[Sequence[str]] = None,
-        as_of: Optional[str] = None,
-        back_to: Optional[str] = None,
-        up_to: Optional[str] = None,
-        asof_date: Optional[str] = None,
-        asof_back_to: Optional[str] = None,
-        limit: Optional[int] = None,
-        column_filters: Optional[str] = None,
-        disable_view: bool = False,
         client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+        params: Optional[Dict[str, Any]] = None,
+        **kw: Any,
     ) -> List[Dict[str, Any]]:
         """Get the query result as a flattened JSON list of dicts.
 
+        Takes query()'s parameters (all protocol parameters pass through
+        verbatim; all keyword-only, positional use deprecated; see query()).
         Returns an empty list on error or empty result.
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            name, user, token, kw = cls._legacy_query_args("get_json", legacy, name, user, token, kw)
 
         json_result = cls.query(
-            name,
-            user,
-            token,
-            key,
-            keys,
-            as_of,
-            back_to,
-            up_to,
-            asof_date,
-            asof_back_to,
-            limit,
-            column_filters,
-            disable_view,
+            name=name,
+            user=user,
+            token=token,
             client_version=client_version,
+            params=params,
+            **kw,
         )
         if not json_result:
             return []
@@ -1042,25 +1192,18 @@ class Unifier:
     @classmethod
     def stream(
         cls,
-        name: str,
+        *,
+        name: Optional[str] = None,
         user: Optional[str] = None,
         token: Optional[str] = None,
-        key: Optional[str] = None,
-        keys: Optional[Sequence[str]] = None,
-        as_of: Optional[str] = None,
-        back_to: Optional[str] = None,
-        up_to: Optional[str] = None,
-        asof_date: Optional[str] = None,
-        asof_back_to: Optional[str] = None,
-        limit: Optional[int] = None,
-        column_filters: Optional[str] = None,
-        disable_view: bool = False,
         client_version: Optional[str] = _AUTO_CLIENT_VERSION,
-        conflation: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        **kw: Any,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Stream the query result row by row as it arrives.
 
-        Same parameters and same transport as query() (including the 202
+        Same parameters (keyword-only; stream() never accepted positional
+        arguments) and same transport as query() (including the 202
         long-poll path and its salvage/backoff machinery), but rows are
         yielded as soon as each one completes instead of waiting for the
         whole body: a front can watch the response roll in as the server
@@ -1073,16 +1216,15 @@ class Unifier:
         flat record is wanted. There is no yield before the first complete
         row.
 
-        Parameters
-        ----------
-        conflation : Optional[str]
-            Stream-only (query() does not accept it). Truthy means on:
-            the value rides the request payload verbatim and the client
-            does not interpret it — which kind of conflation (drop,
-            backfill) is a server-side detail. Off (None or falsy), the
-            field is absent. When on, the POST must be answered 202 — the
-            conflated response forms at a Location like any long-polled
-            response. A direct 200 to a conflation request is an error.
+        The one piece of protocol knowledge the client bakes in: the
+        `conflation` field is ALWAYS present in a stream() payload (query()
+        omits it unless passed), so its presence marks the request as a
+        stream to the server. The value names the conflation mode — a
+        server-side detail; pass conflation=<mode> like any other
+        parameter. Not passed, it is sent as null (JSON null: present,
+        server's default mode). The POST must be answered 202 — the conflated
+        response forms at a Location like any long-polled response; a
+        direct 200 is an error.
 
         Yields
         ------
@@ -1104,12 +1246,11 @@ class Unifier:
 
         Abandoning the generator mid-stream sends the cleanup DELETE to a
         long-polled location, just like any other incomplete query.
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
-        payload = cls._query_payload(
-            name, user, token, key, keys, as_of, back_to, up_to,
-            asof_date, asof_back_to, limit, column_filters, disable_view,
-            client_version, conflation,
-        )
+        payload = cls._payload(name, user, token, client_version, params, kw)
+        payload.setdefault("conflation", None)
         body = cls._body_stream(payload)
         pieces = iter(body)
         # Cleanup is explicit on every exit path: cleanup via nested
@@ -1159,47 +1300,71 @@ class Unifier:
     @classmethod
     def replicate(
         cls,
-        name: str,
-        target_location: str,
-        asof_date: Optional[str] = None,
-        back_to: Optional[str] = None,
-        up_to: Optional[str] = None,
+        *legacy: Any,
+        name: Optional[str] = None,
+        target_location: str = _DEFAULT_TARGET,
+        user: Optional[str] = None,
+        token: Optional[str] = None,
+        client_version: Optional[str] = _AUTO_CLIENT_VERSION,
+        params: Optional[Dict[str, Any]] = None,
         bandwidth_limit: Optional[int] = None,
         use_rclone: bool = True,
+        **kw: Any,
     ) -> None:
         """Replicate data to a local target location using rclone or native python.
 
+        Like query(), the client knows no protocol parameters: everything
+        beyond `name`, credentials and the local options below rides
+        verbatim to the server, from `params` and any extra keyword
+        arguments alike (kw wins on collision).
+
+        All parameters are keyword-only. Positional arguments are deprecated:
+        the positional order of earlier releases still works but warns
+        (FutureWarning) with the equivalent named call, and support will be
+        removed in a future release.
+
         Parameters
         ----------
-        name : str
-            The dataset name to replicate.
+        name : Optional[str]
+            The dataset name to replicate; sent only when given.
         target_location : str
             The local directory path where data should be downloaded.
-        asof_date : Optional[str]
-            The specific date for the data replication (format: YYYY-MM-DD).
-        back_to : Optional[str]
-            The start date for the data replication (format: YYYY-MM-DD).
-        up_to : Optional[str]
-            The end date for the data replication (format: YYYY-MM-DD).
+            Defaults to the current directory.
+        user, token : Optional[str]
+            Override class-level credentials.
+        client_version : Optional[str]
+            As for query(): defaults to this client's actual version.
+        params : Optional[Dict[str, Any]]
+            Protocol parameters, merged into the request payload verbatim.
         bandwidth_limit : Optional[int]
             The bandwidth limit in MB/s for the replication process (rclone only).
         use_rclone : bool
             If True, attempt to use rclone. Falls back to native Python implementation
             if rclone is not available.
+        Protocol parameters and the live contract: see
+        `Unifier.help()` (fetched from the server's OpenAPI document).
         """
+        if legacy:
+            # Pre-0.1.24 order; its dates were sent only when truthy, so a
+            # falsy positional date means "not given".
+            legacy = tuple(
+                None if 2 <= i <= 4 and not v else v for i, v in enumerate(legacy)
+            )
+            a = _legacy_positional(
+                "replicate", _LEGACY_REPLICATE_ORDER, legacy,
+                {"name": name, "target_location": target_location, "user": user,
+                 "token": token, "bandwidth_limit": bandwidth_limit,
+                 "use_rclone": use_rclone, **kw},
+                defaults={"use_rclone": True, "target_location": _DEFAULT_TARGET},
+            )
+            name, target_location, user, token = (
+                a.pop("name"), a.pop("target_location"), a.pop("user"), a.pop("token"))
+            bandwidth_limit, use_rclone = a.pop("bandwidth_limit"), a.pop("use_rclone")
+            kw = a
+        if target_location is None:   # an explicit None: the default
+            target_location = _DEFAULT_TARGET
         headers = {"Content-Type": "application/json"}
-        payload = {
-            "name": name,
-            "user": cls.user,
-            "token": cls.token,
-        }
-        
-        if asof_date:
-            payload["asof_date"] = asof_date
-        if back_to:
-            payload["back_to"] = back_to
-        if up_to:
-            payload["up_to"] = up_to
+        payload = cls._payload(name, user, token, client_version, params, kw)
 
         # Check for rclone availability
         rclone_path = shutil.which("rclone")

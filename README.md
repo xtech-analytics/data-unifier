@@ -5,6 +5,7 @@ Unifier is a Python package that provides a simple interface to interact with th
 ## Features
 
 - Query the Unifier API for data.
+- Stream query results row by row as they arrive.
 - Retrieve data in JSON format.
 - Convert API responses into pandas DataFrames for easy data manipulation and analysis.
 - Efficiently replicate large datasets to local storage using rclone integration.
@@ -19,6 +20,8 @@ You can install the package via pip:
 pip install unifier
 ```
 
+Requires Python 3.10 or later.
+
 To use the **Data Replication** feature, it is recommended to install [rclone](https://rclone.org/downloads/) for better performance. If `rclone` is not available, the package will automatically fall back to a native Python implementation for downloads.
 
 ## Usage
@@ -32,8 +35,13 @@ from unifier import unifier
 unifier.user = 'your_username'
 unifier.token = 'your_api_token'
 
-# Query the API
-response = unifier.query(name='your_dataset_name')
+# Query the API. Arguments are passed by name and sent to the server as
+# given; unifier.help() prints the parameters the server accepts.
+response = unifier.query(name='your_dataset_name', limit=10)
+
+# Stream rows as they arrive
+for row in unifier.stream(name='your_dataset_name'):
+    print(row)
 
 # Convert the response to a DataFrame
 df = unifier.get_dataframe(name='your_dataset_name')
@@ -92,6 +100,8 @@ unifier.replicate(
 ## Configuration
 
 Before using the package, ensure you set your `user` and `token` attributes in the `unifier` class to authenticate with the API.
+
+All arguments are keyword-only. Positional arguments still work for now but are deprecated and print a warning naming the equivalent keyword call.
 
 ## License
 
