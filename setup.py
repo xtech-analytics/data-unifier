@@ -16,7 +16,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'requests',
-        'urllib3>=2',   # HTTPResponse.read1 (streaming reads)
+        'urllib3>=2.2.0',   # HTTPResponse.read1 (streaming reads; dropped in 2.0, restored in 2.2)
         'ijson',
         'pandas',
         'boto3',
