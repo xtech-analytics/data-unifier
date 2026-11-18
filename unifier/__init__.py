@@ -5,5 +5,8 @@ documented by the server's OpenAPI document — call
 """
 
 from .unifier import Unifier as unifier
+from .unifier import UnifierError
 
-__all__ = ['unifier']
+__version__ = unifier.__version__
+
+__all__ = ['unifier', 'UnifierError']

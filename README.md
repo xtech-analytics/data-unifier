@@ -101,7 +101,17 @@ unifier.replicate(
 
 Before using the package, ensure you set your `user` and `token` attributes in the `unifier` class to authenticate with the API.
 
+To send extra HTTP headers with every request (for example an `Authorization` header), set them on the class:
+
+```python
+unifier.headers = {"Authorization": "Bearer <token>"}
+```
+
 All arguments are keyword-only. Positional arguments still work for now but are deprecated and print a warning naming the equivalent keyword call.
+
+## Error handling
+
+Failures raise `unifier.UnifierError` — transport errors, non-200 answers, and responses that are not the expected JSON — from queries, streams, the catalog calls and `replicate()`. For the behavior of releases before 0.1.24 (log a warning and return an empty result, sending exactly the requests those releases sent), pass `client_version=None` per call, or set `UNIFIER_CLIENT_VERSION_OVERRIDE=none` in the environment (read when the client is imported) to keep that behavior process-wide with no code changes. `stream()` needs a server that supports streaming and is not available in that mode.
 
 ## License
 
