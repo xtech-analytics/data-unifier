@@ -173,9 +173,9 @@ class _BodyStream:
     # direct 200) so a front can clean up after interpretation failures
     # without knowing which path the transport took. A future front can
     # consume these bytes with a different interpretation than query().
-    # A consumer that abandons a long-polled stream mid-way sends the
-    # cleanup DELETE to its location (GeneratorExit), just like a real
-    # transport failure does.
+    # A consumer that abandons a long-polled stream mid-way (GeneratorExit),
+    # or a Ctrl-C that interrupts it, sends the cleanup DELETE to its
+    # location, just like a real transport failure does.
 
     def __init__(self, client, payload, legacy_mode=False):
         self.client = client
@@ -250,12 +250,18 @@ class _BodyStream:
             self.location = urljoin(response.url, location)
             try:
                 yield from self.client._range_poll(self, self.location)
-            except GeneratorExit:
-                # The consumer abandoned the stream mid-long-poll: the
-                # location is an incomplete resource, so clean it up like
-                # any other incomplete query. (GeneratorExit must be
-                # re-raised after cleanup.) Skipped when a front has
-                # already abandoned explicitly (location cleared).
+            except Exception:
+                # Errors: _range_poll sends its own cleanup DELETE before
+                # raising them.
+                raise
+            except BaseException:
+                # The consumer abandoned the stream mid-long-poll
+                # (GeneratorExit), or the process was interrupted while
+                # blocked in it (Ctrl-C's KeyboardInterrupt, SystemExit):
+                # the location is an incomplete resource, so clean it up
+                # like any other incomplete query, then re-raise unchanged.
+                # Skipped when a front has already abandoned explicitly
+                # (location cleared).
                 if self.location is not None:
                     self.client._cleanup_delete(
                         session,
@@ -694,6 +700,12 @@ class Unifier:
     location_ttl_margin = 10
     retry_after_default = 1
 
+    # Seconds a best-effort cleanup DELETE may wait on the server (connect,
+    # and each read) before giving up: an unresponsive server must not
+    # block the caller's exit — above all a Ctrl-C. A DELETE that gives up
+    # is logged; the location still expires on the server's idle TTL.
+    cleanup_timeout = 5
+
     # Extra HTTP headers sent with every request — the query POST, the
     # long-poll GETs and cleanup DELETEs, the catalog calls, replicate
     # and help() — e.g. an Authorization header. They override the
@@ -706,7 +718,7 @@ class Unifier:
     STALENESS_TARGET = 1
     ALPHA = 0.25
 
-    __version__ = '0.1.24'
+    __version__ = '0.1.25'
 
     # Process-level default for the client_version field, read once at
     # import from UNIFIER_CLIENT_VERSION_OVERRIDE: unset -> this client's
@@ -1512,7 +1524,7 @@ class Unifier:
         # arriving.
         cleanup = ""
         try:
-            response = session.delete(location)
+            response = session.delete(location, timeout=cls.cleanup_timeout)
             if not 200 <= response.status_code < 300:
                 cleanup = (
                     f"; cleanup DELETE failed with status code"
